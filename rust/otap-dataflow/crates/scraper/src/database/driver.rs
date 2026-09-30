@@ -87,11 +87,14 @@ pub trait DriverAdapter {
     ///
     /// - Require one read-only SELECT; reject extra statements and row-locking
     ///   forms such as `SELECT ... FOR UPDATE`.
-    /// - Verify all configured cursor binds are real parameters used by the full keyset
+    /// - In snapshot mode, require no cursor binds or columns; ordering and
+    ///   uniqueness are unnecessary. Return the entire result or an error when
+    ///   row or normalized-byte bounds would truncate it.
+    /// - In keyset modes, verify all configured cursor binds are real parameters used by the full keyset
     ///   predicate, which must select only rows strictly after the supplied cursor.
-    /// - Require deterministic ascending ordering on the scalar key, or on the
+    /// - For keysets, require deterministic ascending ordering on the scalar key, or on the
     ///   composite timestamp and tie-breaker, consistent with the predicate.
-    /// - Require present, non-null cursor columns compatible with the declared
+    /// - For keysets, require present, non-null cursor columns compatible with the declared
     ///   types without rounding, truncation, or signed/unsigned coercion.
     /// - Scalar keys must be unique across the result, not merely within a page.
     ///   String keys require binary UTF-8 ordering without case folding, locale
@@ -112,9 +115,13 @@ pub trait DriverAdapter {
         query: &CompiledQuery,
     ) -> Result<Vec<ColumnMetadata>, Self::Error>;
 
-    /// Executes one compiled query strictly after the committed cursor.
+    /// Executes a complete snapshot or a keyset page after the committed cursor.
     ///
-    /// Implementations bind the cursor through named database parameters and
+    /// Snapshot implementations bind no cursor parameters and must return every
+    /// row with `Cursor::Snapshot`. Detect overflow with a bounded extra-row
+    /// probe and return an error instead of a partial result.
+    ///
+    /// Keyset implementations bind the cursor through named database parameters and
     /// return a bounded page whose rows each carry their own cursor.
     /// Callers must successfully validate this same query with
     /// [`Self::validate_query`] before its first execution. Substitute cursor

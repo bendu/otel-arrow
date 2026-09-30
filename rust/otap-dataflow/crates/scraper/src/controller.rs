@@ -1,9 +1,11 @@
 // Copyright The OpenTelemetry Authors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Shared ACK-driven scalar and composite watermark receiver core.
+//! Shared ACK-driven snapshot, scalar, and composite receiver core.
 //!
-//! Delivery is at least once. A page is emitted with a unique batch ID, and the
+//! Keyset delivery is at least once subject to source retention. Snapshots are
+//! periodic full observations; retries query current data, not a stored result.
+//! A page is emitted with a unique batch ID, and the
 //! durable cursor advances only after a matching ACK is followed by a
 //! successful checkpoint write. A retryable NACK replays from the durable cursor
 //! after a fixed backoff; a permanent NACK pauses this source by default or
@@ -302,6 +304,10 @@ enum ProgressError {
 }
 
 fn ensure_cursor_advanced(committed: &Cursor, candidate: &Cursor) -> Result<(), ProgressError> {
+    // Snapshots have no row ordering; only matching no-position markers are valid.
+    if matches!((committed, candidate), (Cursor::Snapshot, Cursor::Snapshot)) {
+        return Ok(());
+    }
     if candidate.compare(committed)? != std::cmp::Ordering::Greater {
         return Err(ProgressError::NonAdvancingCursor);
     }
@@ -379,6 +385,11 @@ impl ReceiverState {
     }
 
     fn can_continue_cycle(&self, now: Instant) -> bool {
+        // Re-executing a snapshot immediately would emit the same full result
+        // repeatedly rather than make keyset progress. Always cool down.
+        if matches!(self.committed, Cursor::Snapshot) {
+            return false;
+        }
         self.cycle.as_ref().is_some_and(|cycle| {
             cycle.pages_started < self.catch_up.max_pages
                 && now.saturating_duration_since(cycle.started) < self.catch_up.max_duration
