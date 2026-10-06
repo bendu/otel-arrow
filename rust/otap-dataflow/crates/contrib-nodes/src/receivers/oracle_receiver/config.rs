@@ -41,7 +41,7 @@ const fn default_fetch_size_rows() -> usize {
     300
 }
 
-/// Validated configuration for one Oracle scalar or composite watermark query.
+/// Validated configuration for one Oracle snapshot or keyset query.
 pub struct OracleReceiverConfig {
     source_id: String,
     connection: OracleConnectionConfig,
@@ -144,6 +144,7 @@ impl TryFrom<RawOracleConfig> for OracleReceiverConfig {
         config.watermark.validate()?;
         config.checkpoint.validate()?;
         let output = match &mut config.watermark {
+            WatermarkConfig::Snapshot {} => OutputConfig::default(),
             WatermarkConfig::Composite {
                 timestamp,
                 tie_breaker,
@@ -189,6 +190,12 @@ impl TryFrom<RawOracleConfig> for OracleReceiverConfig {
         // Preserve the exact composite fingerprint schema and field ordering.
         // A scalar fingerprint has a separate mode and an explicitly typed initial value.
         let fingerprint = match &config.watermark {
+            WatermarkConfig::Snapshot {} => serde_json::to_vec(&SnapshotFingerprintInput {
+                source_id: &config.source_id,
+                connect_string: &config.connection.connect_string,
+                statement: query.sql(),
+                mode: "snapshot",
+            }),
             WatermarkConfig::Composite {
                 timestamp,
                 tie_breaker,
@@ -231,6 +238,14 @@ impl TryFrom<RawOracleConfig> for OracleReceiverConfig {
             config_fingerprint,
         })
     }
+}
+
+#[derive(Serialize)]
+struct SnapshotFingerprintInput<'a> {
+    source_id: &'a str,
+    connect_string: &'a str,
+    statement: &'a str,
+    mode: &'static str,
 }
 
 #[derive(Serialize)]
@@ -357,6 +372,18 @@ fn validate_statement(
         ));
     }
     let (timestamp, tie_breaker) = match watermark {
+        WatermarkConfig::Snapshot {} => {
+            // No cursor parameters are bound in snapshot mode. Keep the single
+            // SELECT restriction above and reject locking and SELECT INTO forms.
+            if tokens.iter().any(|token| {
+                token.text.starts_with(':') || matches!(token.text.as_str(), "FOR" | "INTO")
+            }) {
+                return Err(OracleConfigError::new(
+                    "snapshot query must be a read-only SELECT without binds, FOR, or INTO",
+                ));
+            }
+            return Ok(statement);
+        }
         WatermarkConfig::Composite {
             timestamp,
             tie_breaker,

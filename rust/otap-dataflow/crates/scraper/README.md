@@ -40,7 +40,7 @@ implementations.
 
 The design is scheduled, read-only query polling, not Change Data Capture
 (CDC). The [database receiver RFC][database-rfc] remains broader than the initial
-single-query runtime with scalar and composite watermarks.
+single-query runtime with snapshot, scalar, and composite modes.
 
 ## Architecture and Responsibilities
 
@@ -188,10 +188,36 @@ Earlier pre-release configurations must rename `fetch_size` to
 `fetch_size_rows`; the old name is not accepted as an alias. The row-count
 meaning and bounds are unchanged.
 
+### Snapshot Polling
+
+Use `watermark: { mode: snapshot }` for a complete result on each polling
+interval. No cursor column, initial value, bind, uniqueness, or ordering is
+required. Snapshot results may include duplicate or null values. All selected
+columns are still mapped to the log body; no column is tracked as progress.
+
+A nonempty snapshot is one pending batch. Only its matching ACK followed by a
+successful checkpoint write advances the durable revision. The cursor is JSON
+`null` (no source position), not a row offset, hash, or stored copy of the data.
+The next poll starts after `interval`, regardless of catch-up budgets. An empty
+snapshot emits nothing, leaves the checkpoint unchanged, and waits the interval.
+
+Adapters must return a complete bounded snapshot or fail. They must detect
+results exceeding `max_rows_per_poll` or the normalized-byte limit, rather than
+silently return a prefix. The shared encoder rejects snapshots exceeding the
+serialized-byte limit; it never emits or checkpoints a prefix. Split an oversized
+source into independently configured queries or increase the supported bounds.
+
+NACKs, crashes before commit, and restarts re-execute the full query. Retries read
+the data available at that time; no historical result is retained. Unchanged rows
+are emitted again on every interval, and changes between polls can be missed.
+This is periodic observation, not CDC, deduplication, or guaranteed replay of
+transient rows. The existing source lease, checkpoint identity checks, permanent
+rejection policy, and worker cleanup rules still apply.
+
 ### Watermark Configuration
 
-Both `mode: scalar` and `mode: composite` are supported by the shared runtime.
-Snapshot mode is not implemented. Vendor receivers must explicitly support
+`mode: snapshot`, `mode: scalar`, and `mode: composite` are supported.
+Vendor receivers must explicitly support
 and validate a mode before executing it; these examples are shared contract
 values, not complete runnable receiver configurations.
 
@@ -821,9 +847,9 @@ error messages must not become metric dimensions.
 ## Limits
 
 - This is not a runnable generic receiver, SQL Agent binary, installer, or exporter.
-- Scalar and composite cursor configuration and `on_nack: rewind` are accepted; permanent rejection separately supports `on_permanent_nack: pause | retry`.
+- Snapshot, scalar, and composite configuration and `on_nack: rewind` are accepted; permanent rejection separately supports `on_permanent_nack: pause | retry`.
 - File checkpoints, leases, scheduling, mapping, and feedback are shared library functionality; database I/O and node registration remain vendor responsibilities.
-- Multiple named queries, jitter, snapshot polling, richer output mapping, collection of database metrics as an output signal, and CDC are not implemented. Internal runtime counters are implemented.
+- Multiple named queries, jitter, richer output mapping, collection of database metrics as an output signal, and CDC are not implemented. Internal runtime counters are implemented.
 - Byte-limit validation does not bound RSS or native allocations. Local memory-pressure state gates new fetches, but full global `MemoryAdmission` accounting is not implemented.
 - Authentication capabilities, credential rotation, TLS configuration, distributed ownership, and automatic source partitioning require separate work.
 - Bounded immediate catch-up is the default, with configurable cycle budgets and memory-pressure new-fetch gating. Whole-poll and normal-operation ACK deadlines are not; elapsed catch-up budgets only gate the next fetch.
