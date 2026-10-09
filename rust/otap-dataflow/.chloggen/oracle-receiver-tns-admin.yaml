@@ -1,0 +1,5 @@
+change_type: enhancement
+component: pipeline
+note: Allow the Oracle receiver to configure the TNS_ADMIN directory used for Oracle network files.
+issues: [3918]
+subtext:

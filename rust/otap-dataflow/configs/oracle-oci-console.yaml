@@ -26,6 +26,8 @@ groups:
               connection:
                 connect_string: '${env:ORACLE_CONNECT_STRING:-//localhost:1521/FREEPDB1}'
                 instant_client_dir: '${env:ORACLE_INSTANT_CLIENT_DIR:-/opt/oracle/instantclient}'
+                # Optional; when omitted, Oracle honors the process TNS_ADMIN setting.
+                # tns_admin: /path/to/oracle/network/admin
               query:
                 statement: >
                   SELECT EVENT_ID, EVENT_TS, PAYLOAD

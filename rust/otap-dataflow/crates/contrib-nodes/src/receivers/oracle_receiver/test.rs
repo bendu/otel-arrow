@@ -7,7 +7,8 @@ macro_rules! oracle_module_tests {
         mod tests {
             use super::{
                 CellValue, OracleAdapterError, OracleType, bounded_connect_string,
-                cursor_bind_timestamp, cursor_bind_type, discovery_cursor_bind_type,
+                client_settings, cursor_bind_timestamp, cursor_bind_type,
+                discovery_cursor_bind_type,
                 extract_normalized_cursor, finite_float, parse_cursor_timestamp,
                 validate_described_cursor_columns, validate_types,
             };
@@ -149,7 +150,40 @@ macro_rules! oracle_module_tests {
                 super::OracleAdapter::new(super::OracleAdapterConfig {
                     connect_string: String::new(),
                     instant_client_dir: String::new(),
+                    tns_admin: None,
                 }, super::super::tests::test_provider())
+            }
+
+            /// Scenario: Oracle configuration supplies a TNS_ADMIN directory for network files.
+            /// Guarantees: The validated path reaches the adapter settings used for client initialization unchanged.
+            #[test]
+            fn forwards_tns_admin_to_adapter() {
+                let mut raw = super::super::tests::documented_config();
+                raw["connection"]["tns_admin"] = "/run/oracle/network/admin".into();
+                let config: super::super::OracleReceiverConfig =
+                    serde_json::from_value(raw).expect("configuration");
+                let adapter = config.adapter(super::super::tests::test_provider());
+                assert_eq!(
+                    adapter.config.tns_admin.as_deref(),
+                    Some("/run/oracle/network/admin")
+                );
+            }
+
+            /// Scenario: One receiver inherits TNS_ADMIN while another configures the identical directory.
+            /// Guarantees: Process-global conflict detection compares their effective Oracle client settings.
+            #[test]
+            fn inherited_and_explicit_tns_admin_are_equivalent() {
+                let inherited = client_settings(
+                    "/opt/oracle/instantclient",
+                    None,
+                    Some("/run/oracle/network/admin".into()),
+                );
+                let explicit = client_settings(
+                    "/opt/oracle/instantclient",
+                    Some("/run/oracle/network/admin"),
+                    Some("/ignored/by/explicit/config".into()),
+                );
+                assert_eq!(inherited, explicit);
             }
 
             struct UnavailableProvider {
@@ -2037,14 +2071,15 @@ fn rejects_oversized_source_id() {
 }
 
 /// Scenario: Two configurations differ only in the client installation, or only in semantics.
-/// Guarantees: Changing the client location preserves the durable checkpoint, while changing the query or a
-/// cursor definition invalidates it so an unrelated position is never resumed.
+/// Guarantees: Changing client library or network configuration locations preserves the durable checkpoint,
+/// while changing the query or a cursor definition invalidates it so an unrelated position is never resumed.
 #[test]
 fn fingerprint_tracks_semantics_and_ignores_client_location() {
     let baseline = parsed(documented_config()).expect("baseline should parse");
 
     let mut relocated = documented_config();
     relocated["connection"]["instant_client_dir"] = serde_json::json!("/opt/oracle/ic-23");
+    relocated["connection"]["tns_admin"] = serde_json::json!("/run/oracle/network/admin");
     let relocated = parsed(relocated).expect("relocated client should parse");
     assert_eq!(
         baseline.config_fingerprint(),
@@ -2066,6 +2101,16 @@ fn fingerprint_tracks_semantics_and_ignores_client_location() {
         baseline.config_fingerprint(),
         different_source.config_fingerprint()
     );
+}
+
+/// Scenario: Oracle configuration supplies an empty TNS_ADMIN directory.
+/// Guarantees: Validation rejects an unusable explicit path while allowing the field to be omitted.
+#[test]
+fn rejects_empty_tns_admin() {
+    _ = parsed(documented_config()).expect("optional path may be omitted");
+    let mut config = documented_config();
+    config["connection"]["tns_admin"] = serde_json::json!(" ");
+    assert!(parsed(config).is_err());
 }
 
 /// Scenario: Equivalent configured starting instants use different offsets and timestamp spellings.

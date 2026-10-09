@@ -100,6 +100,7 @@ impl OracleReceiverConfig {
             OracleAdapterConfig {
                 connect_string: self.connection.connect_string.clone(),
                 instant_client_dir: self.connection.instant_client_dir.clone(),
+                tns_admin: self.connection.tns_admin.clone(),
             },
             credentials,
         )
@@ -125,6 +126,9 @@ impl TryFrom<RawOracleConfig> for OracleReceiverConfig {
             "connection.instant_client_dir",
             &config.connection.instant_client_dir,
         )?;
+        if let Some(tns_admin) = &config.connection.tns_admin {
+            required("connection.tns_admin", tns_admin)?;
+        }
         required("query.statement", &config.query.statement)?;
         if !(MIN_ORACLE_INTERVAL..=MAX_ORACLE_INTERVAL).contains(&config.query.interval)
             || config.query.interval.subsec_nanos() != 0
@@ -261,8 +265,9 @@ struct ScalarFingerprintInput<'a> {
 
 /// Semantic fields identifying one checkpoint stream.
 ///
-/// Credential file paths and the Instant Client directory are excluded so
-/// rotating a mounted secret cannot invalidate durable state.
+/// Credential file paths and Oracle client directories are excluded so
+/// rotating a mounted secret or relocating client configuration cannot
+/// invalidate durable state.
 #[derive(Serialize)]
 struct FingerprintInput<'a> {
     source_id: &'a str,
@@ -291,6 +296,8 @@ struct RawOracleConfig {
 struct OracleConnectionConfig {
     connect_string: String,
     instant_client_dir: String,
+    #[serde(default)]
+    tns_admin: Option<String>,
 }
 
 #[derive(Deserialize)]

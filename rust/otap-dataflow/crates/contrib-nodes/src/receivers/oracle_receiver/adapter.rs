@@ -16,13 +16,14 @@ use otel_arrow_dfe_scraper::database::{
     CellValue, ColumnMetadata, CompiledQuery, CompiledWatermark, CompositeCursor, Cursor,
     CursorRow, DatabaseSystem, DriverAdapter, DriverCancellation, QueryPage, Row, ScalarValue,
 };
+use std::ffi::OsString;
 use std::mem::size_of;
 use std::str::FromStr;
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 // Oracle client initialization is process-global. The mutex only serializes
-// the one-time directory choice when multiple pipeline instances start.
-static ORACLE_CLIENT_DIRECTORY: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+// the one-time client settings choice when multiple pipeline instances start.
+static ORACLE_CLIENT_SETTINGS: OnceLock<Mutex<Option<OracleClientSettings>>> = OnceLock::new();
 const MAX_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 const MAX_TIMESTAMP_COMPONENT_DIGITS: usize = 9;
 
@@ -30,6 +31,13 @@ const MAX_TIMESTAMP_COMPONENT_DIGITS: usize = 9;
 pub(crate) struct OracleAdapterConfig {
     pub(crate) connect_string: String,
     pub(crate) instant_client_dir: String,
+    pub(crate) tns_admin: Option<String>,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct OracleClientSettings {
+    instant_client_dir: String,
+    tns_admin: Option<OsString>,
 }
 
 /// Oracle adapter that reuses one connection across non-overlapping polls.
@@ -1287,7 +1295,9 @@ fn connect(
     timeout: std::time::Duration,
     cancellation: &OracleCancellation,
 ) -> Result<Connection, OracleAdapterError> {
-    cancellation.native_call(|| initialize_client(&config.instant_client_dir))?;
+    cancellation.native_call(|| {
+        initialize_client(&config.instant_client_dir, config.tns_admin.as_deref())
+    })?;
     let connect_string = bounded_connect_string(&config.connect_string, timeout)?;
     cancellation.native_call(|| {
         Connection::connect(
@@ -1343,14 +1353,18 @@ fn bounded_connect_string(
     ))
 }
 
-/// Applies the process-global Instant Client directory exactly once.
-fn initialize_client(directory: &str) -> Result<(), OracleAdapterError> {
-    let selected = ORACLE_CLIENT_DIRECTORY.get_or_init(|| Mutex::new(None));
+/// Applies the process-global Oracle client settings exactly once.
+fn initialize_client(
+    instant_client_dir: &str,
+    tns_admin: Option<&str>,
+) -> Result<(), OracleAdapterError> {
+    let requested = client_settings(instant_client_dir, tns_admin, std::env::var_os("TNS_ADMIN"));
+    let selected = ORACLE_CLIENT_SETTINGS.get_or_init(|| Mutex::new(None));
     let mut selected = selected
         .lock()
         .map_err(|_| OracleAdapterError::ClientInitializationLock)?;
-    if let Some(existing) = selected.as_deref() {
-        return if existing == directory {
+    if let Some(existing) = selected.as_ref() {
+        return if existing == &requested {
             Ok(())
         } else {
             Err(OracleAdapterError::ClientDirectoryConflict)
@@ -1360,12 +1374,32 @@ fn initialize_client(directory: &str) -> Result<(), OracleAdapterError> {
         return Err(OracleAdapterError::ClientAlreadyInitialized);
     }
     let mut params = oracle::InitParams::new();
-    _ = params
-        .oracle_client_lib_dir(directory)
-        .and_then(|params| params.init())
+    let params = params
+        .oracle_client_lib_dir(instant_client_dir)
         .map_err(|error| OracleAdapterError::Initialize(error.into()))?;
-    *selected = Some(directory.to_owned());
+    if let Some(tns_admin) = tns_admin {
+        _ = params
+            .oracle_client_config_dir(tns_admin)
+            .map_err(|error| OracleAdapterError::Initialize(error.into()))?;
+    }
+    _ = params
+        .init()
+        .map_err(|error| OracleAdapterError::Initialize(error.into()))?;
+    *selected = Some(requested);
     Ok(())
+}
+
+fn client_settings(
+    instant_client_dir: &str,
+    configured_tns_admin: Option<&str>,
+    environment_tns_admin: Option<OsString>,
+) -> OracleClientSettings {
+    OracleClientSettings {
+        instant_client_dir: instant_client_dir.to_owned(),
+        tns_admin: configured_tns_admin
+            .map(OsString::from)
+            .or(environment_tns_admin),
+    }
 }
 
 /// Rejects result types that lack a precision-preserving normalization path.
@@ -1590,10 +1624,10 @@ pub enum OracleAdapterError {
     #[error("Oracle client initialization failed (OCI {oci:?}, DPI {dpi:?})", oci = .0.oci_code(), dpi = .0.dpi_code())]
     Initialize(OracleErrorCodes),
     /// Oracle was already initialized outside this adapter.
-    #[error("Oracle client was initialized before instant_client_dir was applied")]
+    #[error("Oracle client was initialized before configured client directories were applied")]
     ClientAlreadyInitialized,
-    /// Another adapter selected a different process-global client directory.
-    #[error("instant_client_dir conflicts with the initialized Oracle client")]
+    /// Another adapter selected different process-global client settings.
+    #[error("Oracle client directories conflict with the initialized Oracle client")]
     ClientDirectoryConflict,
     /// Oracle client initialization state was poisoned.
     #[error("Oracle client initialization lock was poisoned")]

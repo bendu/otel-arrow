@@ -61,19 +61,20 @@ checkpoint behavior in the receiver's `config` block. Configure credential
 acquisition through a pipeline extension and capability binding, and choose
 destination routing in the pipeline's connections and exporters.
 
-`connection.instant_client_dir` selects the native Oracle libraries. The
-composite watermark uses nested `timestamp` and `tie_breaker` objects, each with
-explicit `bind` and `initial` values, under `mode: composite`. Scalar mode
-supports signed integers, unsigned integers, strings, and timestamps. Snapshot
-mode requires no cursor columns. Supply every field marked required below,
-including `max_batch_bytes` and `nack_backoff`.
+`connection.instant_client_dir` selects the native Oracle libraries.
+`connection.tns_admin` optionally selects the directory containing Oracle
+network configuration files. The composite watermark uses nested `timestamp`
+and `tie_breaker` objects, each with explicit `bind` and `initial` values, under
+`mode: composite`. Scalar mode supports signed integers, unsigned integers,
+strings, and timestamps. Snapshot mode requires no cursor columns. Supply every
+field marked required below, including `max_batch_bytes` and `nack_backoff`.
 
 ### Top-Level Fields
 
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
 | `source_id` | string | **required** | Non-empty logical source identity, at most 256 UTF-8 bytes. Used in checkpoints and emitted telemetry; do not include credentials or sensitive connection details. |
-| `connection` | object | **required** | Oracle connection string and Instant Client directory. |
+| `connection` | object | **required** | Oracle connection string, Instant Client directory, and optional network configuration directory. |
 | `query` | object | **required** | One SQL statement and its polling, row, byte, and timeout limits. |
 | `watermark` | object | **required** | Snapshot selection, or a scalar/composite cursor definition and initial position. |
 | `checkpoint` | object | **required** | State directory, NACK policy, replay backoff, and checkpoint-write failure limit. |
@@ -88,6 +89,7 @@ There is no `queries` list, `query.name`, configurable `query.output`, or
 | --- | --- | --- | --- |
 | `connection.connect_string` | string | **required** | Non-empty, single-address Easy Connect string, for example `//database.example.com:1521/ORCL`. |
 | `connection.instant_client_dir` | string | **required** | Non-empty path to the extracted Instant Client libraries on the engine host. All Oracle receivers in one process must use the same directory. |
+| `connection.tns_admin` | string | unset | Non-empty path to the directory containing `tnsnames.ora`, `sqlnet.ora`, or wallet configuration. This is passed to the Oracle client as its configuration directory and overrides the `TNS_ADMIN` environment variable. All Oracle receivers in one process must use the same value. |
 
 The adapter adds `connect_timeout` and `transport_connect_timeout`, each capped
 at 10 seconds and bounded by the configured query timeout, rounded to at least
@@ -98,8 +100,8 @@ These bounds do not establish a whole-poll deadline.
 
 Setting `instant_client_dir` does not replace operating-system library-loader
 setup. See [Oracle Instant Client installation](#oracle-instant-client-installation).
-Changing this directory requires a process restart because client initialization
-is process-global.
+Changing `instant_client_dir` or `tns_admin` requires a process restart because
+client initialization is process-global.
 
 ### Authentication
 
@@ -698,6 +700,8 @@ groups:
               connection:
                 connect_string: '${env:ORACLE_CONNECT_STRING:-//localhost:1521/FREEPDB1}'
                 instant_client_dir: '${env:ORACLE_INSTANT_CLIENT_DIR:-/opt/oracle/instantclient}'
+                # Optional; when omitted, Oracle honors the process TNS_ADMIN setting.
+                # tns_admin: /path/to/oracle/network/admin
               query:
                 statement: >
                   SELECT EVENT_ID, EVENT_TS, PAYLOAD
