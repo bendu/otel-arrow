@@ -83,13 +83,10 @@ impl<'a> ProtobufReader<'a> {
                 return Err(SerializerError::UnexpectedEndOfBuffer);
             }
 
-            unsafe {
-                let result = self.data.get_unchecked(0..length);
+            let (result, remaining) = self.data.split_at(length);
+            self.data = remaining;
 
-                self.data = &self.data[length..];
-
-                Ok(result)
-            }
+            Ok(result)
         }
     }
 
@@ -188,6 +185,55 @@ impl<'a> ProtobufReader<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Scenario: Two length-delimited fields fill the input buffer.
+    /// Guarantees: Reads borrow the payload and advance past exactly each field.
+    #[test]
+    fn test_read_bytes_advances() {
+        let data = [2, 10, 20, 1, 30];
+        let mut reader = ProtobufReader::new(&data);
+
+        let first = reader.read_bytes().unwrap();
+        assert_eq!(first, &[10, 20]);
+        assert_eq!(first.as_ptr(), data[1..].as_ptr());
+        assert_eq!(reader.len(), 2);
+        assert_eq!(reader.read_bytes().unwrap(), &[30]);
+        assert_eq!(reader.len(), 0);
+    }
+
+    /// Scenario: An empty field appears alone or before a nonempty field.
+    /// Guarantees: Reading an empty field consumes only its length prefix.
+    #[test]
+    fn test_read_bytes_empty() {
+        let mut reader = ProtobufReader::new(&[0]);
+        assert!(reader.read_bytes().unwrap().is_empty());
+        assert_eq!(reader.len(), 0);
+
+        let mut reader = ProtobufReader::new(&[0, 1, 42]);
+        assert!(reader.read_bytes().unwrap().is_empty());
+        assert_eq!(reader.len(), 2);
+        assert_eq!(reader.read_bytes().unwrap(), &[42]);
+        assert_eq!(reader.len(), 0);
+    }
+
+    /// Scenario: A field has a missing or incomplete length prefix, or a truncated payload.
+    /// Guarantees: Reads return an error, consuming only a successfully decoded length prefix.
+    #[test]
+    fn test_read_bytes_truncated() {
+        for (data, remaining) in [
+            (&[][..], &[][..]),
+            (&[0x80][..], &[0x80][..]),
+            (&[3][..], &[][..]),
+            (&[3, 10, 20][..], &[10, 20][..]),
+        ] {
+            let mut reader = ProtobufReader::new(data);
+            assert!(matches!(
+                reader.read_bytes(),
+                Err(SerializerError::UnexpectedEndOfBuffer)
+            ));
+            assert_eq!(reader.data, remaining);
+        }
+    }
 
     #[test]
     fn test_read_varint32() {
