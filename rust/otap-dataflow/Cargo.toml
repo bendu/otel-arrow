@@ -146,7 +146,7 @@ kube = { version = "5.0.0", default-features = false, features = ["client", "der
 linkme = "0.3.35"
 local-sync = "0.1.1"
 miette = { version="7.6.0", features = ["fancy"] }
-mimalloc = { version = "0.1.52", features = ["extended", "debug"] }
+mimalloc = { version = "0.1.52", features = ["extended"] }
 # Published dependency scaffold only; the receiver's metadata-bound APIs need a later release.
 mysql_async = { version = "0.37.1", default-features = false, features = ["minimal-rust", "rustls-tls", "tls12"] }
 # Match the driver's mysql_common version range for shared codec error types.
@@ -512,7 +512,7 @@ restriction = { level = "allow", priority = -1 }
 unwrap_used = "deny"
 print_stdout = "deny"
 print_stderr = "deny"
-must-use-candidate = "warn"
+must_use_candidate = "warn"
 await_holding_lock = "warn"
 manual_async_fn = "warn"
 dbg_macro = "warn"
