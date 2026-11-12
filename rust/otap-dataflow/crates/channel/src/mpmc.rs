@@ -193,7 +193,10 @@ pub struct Channel<T> {
 
 impl<T> Channel<T> {
     /// Creates a new MPMC channel with the specified capacity.
-    #[allow(clippy::new_ret_no_self)]
+    #[expect(
+        clippy::new_ret_no_self,
+        reason = "Channel construction returns sender and receiver endpoints sharing the internal channel state"
+    )]
     #[must_use]
     pub fn new(capacity: NonZeroUsize) -> (Sender<T>, Receiver<T>) {
         let channel = Rc::new(Channel {
