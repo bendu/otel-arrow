@@ -451,8 +451,10 @@ fn snapshot_session(store: &CheckpointStore, nack_first: bool, ack_count: usize)
         .set_receiver(wrapper)
         .run_test(|_| async {})
         .run_validation_concurrent(move |mut ctx| async move {
+            let mut original = None;
             if nack_first {
                 let pdata = ctx.recv().await.expect("initial snapshot");
+                original = pdata.payload_ref().encoded_bytes().cloned();
                 assert_eq!(
                     feedback_store
                         .read()
@@ -466,8 +468,15 @@ fn snapshot_session(store: &CheckpointStore, nack_first: bool, ack_count: usize)
                     .await
                     .expect("NACK");
             }
-            for _ in 0..ack_count {
+            for page in 0..ack_count {
                 let pdata = ctx.recv().await.expect("full snapshot");
+                if page == 0
+                    && let Some(original) = original.as_ref()
+                {
+                    let bytes = pdata.payload_ref().encoded_bytes().expect("OTLP replay");
+                    assert_eq!(bytes.as_ref(), original.as_ref());
+                    assert_eq!(bytes.as_ptr(), original.as_ptr(), "reuse snapshot encoding");
+                }
                 let (_, ack) = next_ack(AckMsg::new(pdata)).expect("ACK route");
                 ctx.send_control_msg(NodeControlMsg::Ack(ack))
                     .await
@@ -487,7 +496,7 @@ fn snapshot_session(store: &CheckpointStore, nack_first: bool, ack_count: usize)
 }
 
 /// Scenario: Full snapshots are NACKed, retried, acknowledged twice, and polled again after restart.
-/// Guarantees: Durable revisions count successful snapshots while every execution remains unfiltered by a column cursor.
+/// Guarantees: NACK replay reuses the full encoded observation without querying again, and durable revisions count accepted snapshots.
 #[test]
 fn snapshot_runtime_retries_and_restarts_without_column_tracking() {
     let directory = tempfile::tempdir_in(".").expect("state directory");
@@ -499,7 +508,7 @@ fn snapshot_runtime_retries_and_restarts_without_column_tracking() {
         "source",
         "snapshot-config".into(),
     );
-    assert_eq!(snapshot_session(&store, true, 2), 3);
+    assert_eq!(snapshot_session(&store, true, 2), 2);
     let saved = store.read().expect("read").expect("committed snapshot");
     assert_eq!(saved.revision, 2);
     assert_eq!(saved.cursor, Cursor::Snapshot);

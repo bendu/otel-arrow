@@ -4,11 +4,11 @@
 //! Shared ACK-driven snapshot, scalar, and composite receiver core.
 //!
 //! Keyset delivery is at least once subject to source retention. Snapshots are
-//! periodic full observations; retries query current data, not a stored result.
+//! periodic full observations; retryable NACKs replay the retained encoded result.
 //! A page is emitted with a unique batch ID, and the
 //! durable cursor advances only after a matching ACK is followed by a
-//! successful checkpoint write. A retryable NACK replays from the durable cursor
-//! after a fixed backoff; a permanent NACK pauses this source by default or
+//! successful checkpoint write. A retryable NACK replays with capped exponential
+//! backoff; a permanent NACK pauses this source by default or
 //! uses explicitly configured, capped retry without skipping rows.
 
 use crate::checkpoint::{CheckpointState, CheckpointStore};
@@ -282,11 +282,13 @@ struct RejectionState {
 }
 
 /// Committed cursor plus in-flight and scheduling state.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 struct ReceiverState {
     committed: Cursor,
     revision: u64,
     pending: Option<PendingPage>,
+    retained: Option<EncodedPage>,
+    replay_backoff: Option<RetryBackoff>,
     next_batch_id: u64,
     next_poll: Instant,
     draining: bool,
@@ -350,6 +352,8 @@ impl ReceiverState {
             committed: checkpoint.cursor,
             revision: checkpoint.revision,
             pending: None,
+            retained: None,
+            replay_backoff: None,
             next_batch_id: 1,
             next_poll: now,
             draining: false,
@@ -365,11 +369,21 @@ impl ReceiverState {
     /// At most one page is in flight per source, so a pending ACK/NACK blocks
     /// the next poll and prevents overlapping database work.
     fn can_poll(&self) -> bool {
+        self.can_attempt() && self.retained.is_none()
+    }
+
+    fn can_replay(&self) -> bool {
+        self.can_attempt() && self.retained.is_some()
+    }
+
+    fn can_attempt(&self) -> bool {
         !self.draining && !self.source_paused && self.pending.is_none() && !self.rejection_paused()
     }
 
     fn pause_source(&mut self) {
         self.pending = None;
+        self.retained = None;
+        self.replay_backoff = None;
         self.cycle = None;
         self.source_paused = true;
     }
@@ -382,6 +396,9 @@ impl ReceiverState {
 
     fn reject(&mut self, policy: OnPermanentNack, now: Instant) -> Option<Duration> {
         self.pending = None;
+        // Permanent rejection deliberately keeps its existing re-query policy.
+        self.retained = None;
+        self.replay_backoff = None;
         self.cycle = None;
         let rejection = self.rejection.get_or_insert_with(|| RejectionState {
             policy,
@@ -453,10 +470,18 @@ impl ReceiverState {
         self.committed = checkpoint.cursor;
         self.revision = checkpoint.revision;
         self.pending = None;
+        self.retained = None;
+        self.replay_backoff = None;
         self.rejection = None;
     }
 
-    /// Rewinds to the committed cursor when the feedback matches; else no-op.
+    fn next_replay_delay(&mut self, initial: Duration) -> Duration {
+        self.replay_backoff
+            .get_or_insert(RetryBackoff { next: initial })
+            .next_delay_capped(RETRY_MAX.max(initial))
+    }
+
+    /// Invalidates the attempt, preserving the encoded page and its candidate.
     fn nack(&mut self, batch_id: u64, replay_at: Instant) -> bool {
         if self
             .pending
@@ -610,29 +635,23 @@ where
         let mut deferred_feedback = None;
 
         'receiver: loop {
+            if let Some(stop) = stopping.request.get() {
+                return Ok(stopped_state(stop, &metrics));
+            }
             if let Some(metrics) = metrics.as_mut() {
                 metrics.rejection_paused.set(u64::from(state.rejection_paused()));
+                metrics.retained_bytes.set(state.retained.as_ref().map_or(
+                    0, |page| page.encoded_bytes as u64,
+                ));
             }
             // I/O helpers may have consumed pressure updates, including on an
             // empty query. Reconcile pressure whenever encoder ownership is local.
             let pressure_paused = pause_for_pressure(
                 &admission, &mut state, &mut encoder, query.interval(), Instant::now(),
             );
-            let can_poll = state.can_poll() && !pressure_paused;
+            let can_poll = (state.can_poll() || state.can_replay()) && !pressure_paused;
             tokio::select! {
                 biased;
-
-                () = deadline_elapsed(stopping.wait_deadline.get()), if stopping.request.get().is_some() => {
-                    let Some(stop) = stopping.request.get() else { continue };
-                    if state.pending.is_some() {
-                        otel_warn!(
-                            "database_receiver.drain_wait_expired",
-                            source_id = source_id.as_str(),
-                            message = "Delivery wait ended to reserve worker cleanup time; the checkpoint was not advanced"
-                        );
-                    }
-                    return Ok(stopped_state(stop, &metrics));
-                }
 
                 control = async {
                     match deferred_feedback.take() {
@@ -748,8 +767,9 @@ where
                                 }
                                 continue;
                             }
-                            let replay_at = Instant::now()
-                                .checked_add(nack_backoff)
+                            let delay = state.next_replay_delay(nack_backoff);
+                            let replay_at = tokio::time::Instant::now().into_std()
+                                .checked_add(delay)
                                 .unwrap_or_else(Instant::now);
                             if state.nack(batch_id, replay_at) {
                                 if let Some(metrics) = metrics.as_mut() {
@@ -759,8 +779,8 @@ where
                                     "database_receiver.page_nacked",
                                     source_id = source_id.as_str(),
                                     batch_id = batch_id,
-                                    backoff_millis = nack_backoff.as_millis() as u64,
-                                    message = "Database receiver retained its checkpoint and will replay the page"
+                                    backoff_millis = delay.as_millis() as u64,
+                                    message = "Database receiver will replay retained encoded bytes without querying"
                                 );
                                 if let Some(stop) = stopping.request.get() {
                                     return Ok(stopped_state(stop, &metrics));
@@ -770,9 +790,17 @@ where
                         NodeControlMsg::DrainIngress { deadline, .. } => {
                             state.begin_drain();
                             let stop = stopping.record(StopRequest::Drain(deadline), Instant::now());
-                            if state.pending.is_none() {
-                                return Ok(stopped_state(stop, &metrics));
+                            if state.pending.is_some() {
+                                otel_info!(
+                                    "database_receiver.pending_page_deferred",
+                                    source_id = source_id.as_str(),
+                                    message = "Drain stops without waiting for downstream feedback; unacknowledged progress may replay after restart"
+                                );
                             }
+                            // Downstream shutdown (and its flush) may require us to
+                            // report drained first. Do not spend the stop budget on
+                            // feedback that cannot arrive until after cleanup.
+                            return Ok(stopped_state(stop, &metrics));
                         }
                         NodeControlMsg::Shutdown { deadline, .. } => {
                             let stop = stopping.record(StopRequest::Shutdown(deadline), Instant::now());
@@ -796,46 +824,115 @@ where
                         admission.cycle_interrupted.set(false);
                     }
                     state.begin_poll(now);
-                    let cursor = state.committed.clone();
-                    let page = loop {
-                        if database_retry.failures > 0
-                            && let Some(stop) = wait_database_retry(
-                                Instant::now(), &mut ctrl_msg_recv, &mut metrics,
-                                &admission, &stopping,
-                            ).await?
-                        {
-                            return Ok(stopped_state(stop, &metrics));
-                        }
-                        if let Some(metrics) = metrics.as_mut() {
-                            metrics.polls.add(1);
-                        }
-                        let page = match adapter.begin_operation() {
-                            Ok(cancellation) => match await_database_operation_or_stop(
-                                adapter.execute(&query, &cursor),
-                                cancellation,
-                                &mut ctrl_msg_recv,
-                                &mut metrics,
-                                &lease.abandoned,
-                                &admission,
-                                &stopping,
-                            ).await? {
-                                OperationOutcome::Completed(result) => result,
-                                OperationOutcome::Stopped(stop) => {
-                                    return Ok(stopped_state(stop, &metrics));
+                    if state.retained.is_none() {
+                        let cursor = state.committed.clone();
+                        let page = loop {
+                            if database_retry.failures > 0
+                                && let Some(stop) = wait_database_retry(
+                                    Instant::now(), &mut ctrl_msg_recv, &mut metrics,
+                                    &admission, &stopping,
+                                ).await?
+                            {
+                                return Ok(stopped_state(stop, &metrics));
+                            }
+                            if let Some(metrics) = metrics.as_mut() {
+                                metrics.polls.add(1);
+                            }
+                            let page = match adapter.begin_operation() {
+                                Ok(cancellation) => match await_database_operation_or_stop(
+                                    adapter.execute(&query, &cursor),
+                                    cancellation,
+                                    &mut ctrl_msg_recv,
+                                    &mut metrics,
+                                    &lease.abandoned,
+                                    &admission,
+                                    &stopping,
+                                ).await? {
+                                    OperationOutcome::Completed(result) => result,
+                                    OperationOutcome::Stopped(stop) => {
+                                        return Ok(stopped_state(stop, &metrics));
+                                    }
+                                },
+                                Err(error) => Err(error),
+                            };
+                            match page {
+                                Ok(page) => {
+                                    database_retry.recovered(&source_id);
+                                    break page;
                                 }
-                            },
-                            Err(error) => Err(error),
+                                Err(error) => {
+                                    if let Some(metrics) = metrics.as_mut() {
+                                        metrics.query_failures.add(1);
+                                    }
+                                    if A::should_pause_source(&error) {
+                                        state.pause_source();
+                                        admission.interrupt_cycle();
+                                        encoder.release_scratch();
+                                        otel_warn!(
+                                            "database_receiver.source_paused",
+                                            source_id = source_id.as_str(),
+                                            error = %error,
+                                            message = "Database query exceeded a source-local bound; source paused with checkpoint unchanged. Repair the query or limits and restart this source to resume"
+                                        );
+                                        continue 'receiver;
+                                    }
+                                    database_retry.failed::<A>(
+                                        error, "execute", &source_id, &effect_handler,
+                                    )?;
+                                    admission.interrupt_cycle();
+                                    encoder.release_scratch();
+                                    match prepare_database(
+                                        &mut adapter, &query, &mut database_retry, &source_id,
+                                        &mut ctrl_msg_recv, &effect_handler, &mut metrics,
+                                        &lease.abandoned, &admission, &stopping,
+                                    ).await? {
+                                        OperationOutcome::Completed(_) => {}
+                                        OperationOutcome::Stopped(stop) => {
+                                            return Ok(stopped_state(stop, &metrics));
+                                        }
+                                    }
+                                }
+                            }
                         };
-                        match page {
-                            Ok(page) => {
-                                database_retry.recovered(&source_id);
-                                break page;
+                        let observed_time = observed_time_unix_nano().map_err(|error| {
+                            receiver_error(&effect_handler, ReceiverErrorKind::Other, error)
+                        })?;
+                        let limit = query.max_batch_bytes();
+                        // One bounded page per receiver; encoding is CPU-intensive and
+                        // must not monopolize the thread-per-core engine runtime.
+                        // Move the single-owner cache into the job and back, avoiding
+                        // per-poll configuration clones or a shared mutable cache.
+                        let validation_cursor = state.committed.clone();
+                        let encoding = worker.run(move || {
+                            let encoded = ensure_page_advanced(&validation_cursor, &page)
+                                .map(|()| encoder.encode_page(page, observed_time, limit));
+                            (encoder, encoded)
+                        }).map_err(|error| receiver_error(
+                            &effect_handler, ReceiverErrorKind::Other, error,
+                        ))?;
+                        let (returned_encoder, encoded) = match await_database_operation_or_stop(
+                            encoding, NonInterruptible, &mut ctrl_msg_recv, &mut metrics, &lease.abandoned, &admission, &stopping,
+                        ).await? {
+                            OperationOutcome::Completed(result) => result,
+                            OperationOutcome::Stopped(stop) => return Ok(stopped_state(stop, &metrics)),
+                        }.map_err(|error| receiver_error(
+                            &effect_handler, ReceiverErrorKind::Other, error,
+                        ))?;
+                        encoder = returned_encoder;
+                        if admission.state.should_shed_ingress() {
+                            encoder.release_scratch();
+                        }
+                        let encoded = encoded.map_err(|error| {
+                            receiver_error(&effect_handler, ReceiverErrorKind::Configuration, error)
+                        })?;
+                        let encoded = match encoded {
+                            Ok(Some(encoded)) => encoded,
+                            Ok(None) => {
+                                state.finish_cycle(query.interval(), Instant::now());
+                                continue;
                             }
                             Err(error) => {
-                                if let Some(metrics) = metrics.as_mut() {
-                                    metrics.query_failures.add(1);
-                                }
-                                if A::should_pause_source(&error) {
+                                if should_pause_encoding_error(&error) {
                                     state.pause_source();
                                     admission.interrupt_cycle();
                                     encoder.release_scratch();
@@ -843,98 +940,45 @@ where
                                         "database_receiver.source_paused",
                                         source_id = source_id.as_str(),
                                         error = %error,
-                                        message = "Database query exceeded a source-local bound; source paused with checkpoint unchanged. Repair the query or limits and restart this source to resume"
+                                        message = "Snapshot encoding exceeded a source-local bound; source paused with checkpoint unchanged. Repair the query or limits and restart this source to resume"
                                     );
                                     continue 'receiver;
                                 }
-                                database_retry.failed::<A>(
-                                    error, "execute", &source_id, &effect_handler,
-                                )?;
-                                admission.interrupt_cycle();
-                                encoder.release_scratch();
-                                match prepare_database(
-                                    &mut adapter, &query, &mut database_retry, &source_id,
-                                    &mut ctrl_msg_recv, &effect_handler, &mut metrics,
-                                    &lease.abandoned, &admission, &stopping,
-                                ).await? {
-                                    OperationOutcome::Completed(_) => {}
-                                    OperationOutcome::Stopped(stop) => {
-                                        return Ok(stopped_state(stop, &metrics));
-                                    }
-                                }
+                                // An oversized first row or an invalid mapping
+                                // cannot be skipped without losing data.
+                                return Err(receiver_error(
+                                    &effect_handler,
+                                    ReceiverErrorKind::Configuration,
+                                    error,
+                                ));
                             }
+                        };
+                        ensure_cursor_advanced(&state.committed, &encoded.candidate).map_err(|error| {
+                            receiver_error(&effect_handler, ReceiverErrorKind::Configuration, error)
+                        })?;
+                        if let Some(metrics) = metrics.as_mut() {
+                            metrics.retained_bytes.set(encoded.encoded_bytes as u64);
+                            metrics.event_time_fallbacks.add(encoded.event_time_fallbacks as u64);
                         }
-                    };
-                    let observed_time = observed_time_unix_nano().map_err(|error| {
-                        receiver_error(&effect_handler, ReceiverErrorKind::Other, error)
-                    })?;
-                    let limit = query.max_batch_bytes();
-                    // One bounded page per receiver; encoding is CPU-intensive and
-                    // must not monopolize the thread-per-core engine runtime.
-                    // Move the single-owner cache into the job and back, avoiding
-                    // per-poll configuration clones or a shared mutable cache.
-                    let validation_cursor = state.committed.clone();
-                    let encoding = worker.run(move || {
-                        let encoded = ensure_page_advanced(&validation_cursor, &page)
-                            .map(|()| encoder.encode_page(page, observed_time, limit));
-                        (encoder, encoded)
-                    }).map_err(|error| receiver_error(
-                        &effect_handler, ReceiverErrorKind::Other, error,
-                    ))?;
-                    let (returned_encoder, encoded) = match await_database_operation_or_stop(
-                        encoding, NonInterruptible, &mut ctrl_msg_recv, &mut metrics, &lease.abandoned, &admission, &stopping,
-                    ).await? {
-                        OperationOutcome::Completed(result) => result,
-                        OperationOutcome::Stopped(stop) => return Ok(stopped_state(stop, &metrics)),
-                    }.map_err(|error| receiver_error(
-                        &effect_handler, ReceiverErrorKind::Other, error,
-                    ))?;
-                    encoder = returned_encoder;
-                    if admission.state.should_shed_ingress() {
-                        encoder.release_scratch();
+                        if encoded.event_time_fallbacks > 0 {
+                            otel_warn!(
+                                "database_receiver.event_time_fallback",
+                                source_id = source_id.as_str(),
+                                records = encoded.event_time_fallbacks as u64,
+                                message = "Database records used observation time because source event time was outside the OTLP range"
+                            );
+                        }
+                        state.retained = Some(encoded);
                     }
-                    let encoded = encoded.map_err(|error| {
-                        receiver_error(&effect_handler, ReceiverErrorKind::Configuration, error)
-                    })?;
-                    let encoded = match encoded {
-                        Ok(Some(encoded)) => encoded,
-                        Ok(None) => {
-                            state.finish_cycle(query.interval(), Instant::now());
-                            continue;
-                        }
-                        Err(error) => {
-                            if should_pause_encoding_error(&error) {
-                                state.pause_source();
-                                admission.interrupt_cycle();
-                                encoder.release_scratch();
-                                otel_warn!(
-                                    "database_receiver.source_paused",
-                                    source_id = source_id.as_str(),
-                                    error = %error,
-                                    message = "Snapshot encoding exceeded a source-local bound; source paused with checkpoint unchanged. Repair the query or limits and restart this source to resume"
-                                );
-                                continue 'receiver;
-                            }
-                            // An oversized first row or an invalid mapping
-                            // cannot be skipped without losing data.
-                            return Err(receiver_error(
-                                &effect_handler,
-                                ReceiverErrorKind::Configuration,
-                                error,
-                            ));
-                        }
-                    };
-                    let EncodedPage {
-                        mut pdata,
-                        candidate,
-                        row_count,
-                        encoded_bytes,
-                        deferred_rows,
-                        event_time_fallbacks,
-                    } = encoded;
-                    ensure_cursor_advanced(&state.committed, &candidate).map_err(|error| {
-                        receiver_error(&effect_handler, ReceiverErrorKind::Configuration, error)
-                    })?;
+
+                    let retained = state.retained.as_ref().expect("encoded page retained");
+                    // The pristine context never receives a subscription. Cloning
+                    // pdata shares its immutable Bytes allocation, not row/encoding work.
+                    let mut pdata = retained.pdata.clone();
+                    let candidate = retained.candidate.clone();
+                    let row_count = retained.row_count;
+                    let encoded_bytes = retained.encoded_bytes;
+                    let deferred_rows = retained.deferred_rows;
 
                     let batch_id = state.next_batch_id;
                     let mut call_data = CallData::new();
@@ -966,17 +1010,6 @@ where
                         metrics.batches_sent.add(1);
                         metrics.rows_sent.add(row_count as u64);
                         metrics.encoded_bytes_sent.add(encoded_bytes as u64);
-                        metrics
-                            .event_time_fallbacks
-                            .add(event_time_fallbacks as u64);
-                    }
-                    if event_time_fallbacks > 0 {
-                        otel_warn!(
-                            "database_receiver.event_time_fallback",
-                            source_id = source_id.as_str(),
-                            records = event_time_fallbacks as u64,
-                            message = "Database records used observation time because source event time was outside the OTLP range"
-                        );
                     }
                     otel_debug!(
                         "database_receiver.page_sent",
@@ -1068,8 +1101,12 @@ impl Default for RetryBackoff {
 
 impl RetryBackoff {
     fn next_delay(&mut self) -> Duration {
+        self.next_delay_capped(RETRY_MAX)
+    }
+
+    fn next_delay_capped(&mut self, cap: Duration) -> Duration {
         let delay = self.next;
-        self.next = delay.saturating_mul(2).min(RETRY_MAX);
+        self.next = delay.saturating_mul(2).min(cap);
         delay
     }
 }
@@ -1311,8 +1348,9 @@ async fn deadline_elapsed(deadline: Option<Instant>) {
 /// Waits until the next poll is due, or forever when polling is blocked.
 async fn poll_due(next_poll: Instant, can_poll: bool) {
     if can_poll {
-        if next_poll > Instant::now() {
-            tokio::time::sleep_until(tokio::time::Instant::from_std(next_poll)).await;
+        let next_poll = tokio::time::Instant::from_std(next_poll);
+        if next_poll > tokio::time::Instant::now() {
+            tokio::time::sleep_until(next_poll).await;
         }
     } else {
         std::future::pending::<()>().await;
@@ -1717,7 +1755,12 @@ fn stopped_state(
 ) -> TerminalState {
     let deadline = stop.deadline();
     match metrics {
-        Some(metrics) => TerminalState::new(deadline, [metrics.snapshot()]),
+        Some(metrics) => {
+            // Returning drops the local page, including shutdown during replay backoff.
+            let mut final_metrics = metrics.clone();
+            final_metrics.retained_bytes.set(0);
+            TerminalState::new(deadline, [final_metrics.snapshot()])
+        }
         None => TerminalState::new::<[MetricSetSnapshot; 0]>(deadline, []),
     }
 }

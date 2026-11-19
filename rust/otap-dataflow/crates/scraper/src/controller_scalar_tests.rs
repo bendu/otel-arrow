@@ -224,16 +224,25 @@ fn run_session(
         .set_receiver(wrapper)
         .run_test(|_| async {})
         .run_validation_concurrent(move |mut ctx| async move {
+            let mut original = None;
             if replay {
                 let pdata = ctx.recv().await.expect("first delivery");
+                original = pdata.payload_ref().encoded_bytes().cloned();
                 let (_, nack) =
                     next_nack(NackMsg::new("retry scalar page", pdata)).expect("NACK route");
                 ctx.send_control_msg(NodeControlMsg::Nack(nack))
                     .await
                     .expect("NACK");
             }
-            for _ in 0..pages {
+            for page in 0..pages {
                 let pdata = ctx.recv().await.expect("scalar delivery");
+                if page == 0
+                    && let Some(original) = original.as_ref()
+                {
+                    let bytes = pdata.payload_ref().encoded_bytes().expect("OTLP replay");
+                    assert_eq!(bytes.as_ref(), original.as_ref());
+                    assert_eq!(bytes.as_ptr(), original.as_ptr(), "reuse scalar encoding");
+                }
                 let (_, ack) = next_ack(AckMsg::new(pdata)).expect("ACK route");
                 ctx.send_control_msg(NodeControlMsg::Ack(ack))
                     .await
@@ -250,7 +259,7 @@ fn run_session(
 }
 
 /// Scenario: Each scalar type is polled, NACKed, replayed, ACKed, and resumed after receiver restart.
-/// Guarantees: Native binds resume from the durable typed value and never skip a rejected page.
+/// Guarantees: Replay reuses encoded bytes without another bind, and restart resumes from the durable typed value.
 #[test]
 fn scalar_runtime_replays_and_resumes_all_types() {
     for sequence in sequences() {
@@ -265,9 +274,8 @@ fn scalar_runtime_replays_and_resumes_all_types() {
         );
         let bound = run_session(&store, &sequence, true, 2);
         assert_eq!(
-            &bound[..3],
+            &bound[..2],
             &[
-                Cursor::Scalar(sequence[0].clone()),
                 Cursor::Scalar(sequence[0].clone()),
                 Cursor::Scalar(sequence[1].clone()),
             ]

@@ -106,6 +106,9 @@ mod recovery_tests;
 #[path = "controller_rejection_tests.rs"]
 mod rejection_tests;
 
+#[path = "controller_replay_tests.rs"]
+mod replay_tests;
+
 fn control_channel(message: NodeControlMsg<OtapPdata>) -> local::ControlChannel<OtapPdata> {
     let (sender, receiver) = Channel::new(1);
     sender
@@ -472,7 +475,7 @@ fn ack_commit_advances_cursor_and_clears_pending() {
 
 /// Scenario: a page is negatively acknowledged while one batch is in flight.
 /// Guarantees: the durable cursor is retained and the next poll is deferred to the configured
-/// replay instant, so the same page is re-queried rather than skipped.
+/// replay instant without advancing or skipping the candidate.
 #[test]
 fn nack_retains_cursor_and_schedules_replay() {
     let now = Instant::now();
@@ -508,10 +511,9 @@ fn only_one_page_is_in_flight_per_source() {
 }
 
 /// Scenario: a receiver begins draining while a page is still awaiting ACK/NACK.
-/// Guarantees: no new query is started during drain, so the receiver stops producing work and
-/// only waits for the outstanding page to resolve.
+/// Guarantees: no new query is admitted and the pending cursor remains uncommitted.
 #[test]
-fn drain_stops_new_polls_until_pending_resolves() {
+fn drain_stops_new_polls_without_committing_pending_progress() {
     let now = Instant::now();
     let mut state = ReceiverState::new(checkpoint(0, 0), now, CatchUpConfig::default());
     state.record_sent(checkpoint(0, 1).cursor);
@@ -1080,12 +1082,12 @@ fn checkpoint_write_and_retry_count_discarded_feedback() {
         .run_validation(|_| async {});
 }
 
-/// Scenario: A matching permanent NACK arrives on a fresh or resumed source, including during drain.
+/// Scenario: A matching permanent NACK arrives on a fresh or resumed source.
 /// Guarantees: Collection pauses without another page or checkpoint advancement,
 /// and explicit stop joins workers before releasing the lease for an in-process restart.
 #[test]
 fn permanent_nack_preserves_checkpoint_and_releases_lease() {
-    for (saved, draining) in [(false, false), (true, false), (true, true)] {
+    for saved in [false, true] {
         let directory = tempfile::tempdir_in(".").expect("checkpoint directory");
         let config = CheckpointConfig {
             directory: directory.path().to_string_lossy().into_owned(),
@@ -1136,34 +1138,24 @@ fn permanent_nack_preserves_checkpoint_and_releases_lease() {
             .run_test(|_| async {})
             .run_validation_concurrent(move |mut ctx| async move {
                 let pdata = ctx.recv().await.expect("first page");
-                if draining {
-                    ctx.send_control_msg(NodeControlMsg::DrainIngress {
-                        deadline: Instant::now() + Duration::from_secs(3),
-                        reason: "drain with pending page".to_owned(),
-                    })
-                    .await
-                    .expect("drain");
-                }
                 let (_, nack) =
                     next_nack(NackMsg::new_permanent("private-rejection-detail", pdata))
                         .expect("NACK subscription");
                 ctx.send_control_msg(NodeControlMsg::Nack(nack))
                     .await
                     .expect("permanent NACK");
-                if !draining {
-                    assert!(
-                        tokio::time::timeout(Duration::from_millis(30), ctx.recv())
-                            .await
-                            .is_err(),
-                        "paused receiver stays alive without sending another page"
-                    );
-                    ctx.send_control_msg(NodeControlMsg::Shutdown {
-                        deadline: Instant::now() + Duration::from_secs(1),
-                        reason: "stop paused source".to_owned(),
-                    })
-                    .await
-                    .expect("shutdown");
-                }
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(30), ctx.recv())
+                        .await
+                        .is_err(),
+                    "paused receiver stays alive without sending another page"
+                );
+                ctx.send_control_msg(NodeControlMsg::Shutdown {
+                    deadline: Instant::now() + Duration::from_secs(1),
+                    reason: "stop paused source".to_owned(),
+                })
+                .await
+                .expect("shutdown");
                 assert!(
                     tokio::time::timeout(Duration::from_secs(5), ctx.recv())
                         .await
@@ -1339,7 +1331,6 @@ struct ClosedControlCleanupProbe {
 #[derive(Clone, Copy, Debug)]
 enum CleanupWaitCase {
     Ack,
-    AckBeforeCutoff,
     Send,
     Operation,
     Checkpoint,
@@ -1351,6 +1342,7 @@ struct CleanupBudgetAdapter {
     case: CleanupWaitCase,
     executing: Rc<Cell<bool>>,
     cleanup_started: Rc<Cell<Option<Instant>>>,
+    cleanup_gate: Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>,
 }
 
 #[async_trait(?Send)]
@@ -1396,6 +1388,12 @@ impl DriverAdapter for CleanupBudgetAdapter {
 
     async fn shutdown(&mut self) -> Result<(), Self::Error> {
         self.cleanup_started.set(Some(Instant::now()));
+        if let Some((started, release)) = self.cleanup_gate.take() {
+            self.inner.shutdown().await?;
+            started.send(()).expect("cleanup observer");
+            release.await.expect("release cleanup");
+            return Ok(());
+        }
         // Healthy cleanup must have time to await, not merely succeed on its first poll.
         tokio::time::sleep(Duration::from_millis(40)).await;
         self.inner.shutdown().await
@@ -1407,6 +1405,203 @@ struct CleanupBudgetProbe {
     case: CleanupWaitCase,
     deadline: Rc<Cell<Option<Instant>>>,
     finished: Rc<Cell<bool>>,
+}
+
+struct OrderedDrainProbe {
+    receiver: DatabaseReceiver<CleanupBudgetAdapter>,
+    feedback_before_drain: Option<bool>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DrainFeedback {
+    Ack,
+    RetryableNack,
+    PermanentNack,
+}
+
+#[async_trait(?Send)]
+impl local::Receiver<OtapPdata> for OrderedDrainProbe {
+    async fn start(
+        self: Box<Self>,
+        mut controls: local::ControlChannel<OtapPdata>,
+        effects: local::EffectHandler<OtapPdata>,
+    ) -> Result<TerminalState, Error> {
+        let Self {
+            receiver,
+            feedback_before_drain,
+        } = *self;
+        let (sender, channel) = Channel::new(3);
+        let (finished, completion) = oneshot::channel();
+        let replacement = local::ControlChannel::new(Receiver::Local(LocalReceiver::mpsc(channel)));
+        let (result, ()) = tokio::join!(
+            async {
+                let result = local::Receiver::start(Box::new(receiver), replacement, effects).await;
+                finished.send(()).expect("completion observer");
+                result
+            },
+            async {
+                let drain = loop {
+                    let control = controls.recv().await.expect("drain");
+                    if matches!(control, NodeControlMsg::DrainIngress { .. }) {
+                        break control;
+                    }
+                    sender.send_async(control).await.expect("forward control");
+                };
+                let feedback = if feedback_before_drain.is_some() {
+                    Some(loop {
+                        let control = controls.recv().await.expect("feedback");
+                        if matches!(control, NodeControlMsg::Ack(_) | NodeControlMsg::Nack(_)) {
+                            break control;
+                        }
+                        sender.send_async(control).await.expect("forward control");
+                    })
+                } else {
+                    None
+                };
+                // Preserve both sides of the feedback/drain race explicitly,
+                // without relying on scheduling of the external control sender.
+                if feedback_before_drain == Some(true) {
+                    sender
+                        .send_async(feedback.expect("feedback"))
+                        .await
+                        .expect("queue feedback");
+                    sender.send_async(drain).await.expect("queue drain");
+                } else {
+                    sender.send_async(drain).await.expect("queue drain");
+                    if let Some(feedback) = feedback {
+                        // Cleanup may already have closed the control receiver.
+                        // Either way, late feedback cannot commit or replay.
+                        if let Err(error) = sender.send_async(feedback).await {
+                            assert!(matches!(error, SendError::Closed(_)));
+                        }
+                    }
+                }
+                // Keep controls open until the receiver finishes, as the real
+                // engine does; channel closure must not decide the outcome.
+                completion.await.expect("receiver completed");
+                drop(sender);
+            }
+        );
+        result
+    }
+}
+
+/// Scenario: Drain races no feedback, an ACK, or either NACK kind on a fresh or resumed source.
+/// Guarantees: Cleanup begins without waiting for late feedback, only a pre-drain ACK commits,
+/// no new page is emitted, and joined cleanup releases the lease without a process restart.
+#[test]
+fn pending_page_drain_preserves_progress_across_feedback_races() {
+    use DrainFeedback::{Ack, PermanentNack, RetryableNack};
+
+    for saved in [false, true] {
+        for (feedback_before_drain, feedback_kind) in [
+            (None, Ack),
+            (Some(false), Ack),
+            (Some(true), Ack),
+            (Some(false), RetryableNack),
+            (Some(true), RetryableNack),
+            (Some(false), PermanentNack),
+            (Some(true), PermanentNack),
+        ] {
+            let directory = tempfile::tempdir_in(".").expect("checkpoint directory");
+            let config = CheckpointConfig {
+                directory: directory.path().to_string_lossy().into_owned(),
+                on_nack: OnNack::Rewind,
+                on_permanent_nack: OnPermanentNack::Pause,
+                nack_backoff: Duration::from_secs(60),
+                max_consecutive_failures: 3,
+            };
+            let store = CheckpointStore::new(
+                directory.path(),
+                "group",
+                "pipeline",
+                "pending-drain",
+                "source",
+                "fingerprint".into(),
+            );
+            let previous = saved.then(|| store.write(0, &checkpoint(0, 41).cursor).unwrap().0);
+            let source = SourceBinding::acquire(store.clone()).expect("source binding");
+            let joined = Rc::new(Cell::new(false));
+            let (started, cleanup_started) = oneshot::channel();
+            let (release_cleanup, release) = oneshot::channel();
+            let receiver = DatabaseReceiver::new(
+                CleanupBudgetAdapter {
+                    inner: FakeAdapter {
+                        shutdown_joined: Rc::clone(&joined),
+                        lease_key: store.lease_key().to_path_buf(),
+                    },
+                    case: CleanupWaitCase::Ack,
+                    executing: Rc::new(Cell::new(false)),
+                    cleanup_started: Rc::new(Cell::new(None)),
+                    cleanup_gate: Some((started, release)),
+                },
+                fake_query(&config),
+                source,
+                config.nack_backoff,
+                config.max_consecutive_failures,
+                normal_admission(),
+                None,
+            );
+            let runtime = TestRuntime::<OtapPdata>::new();
+            let wrapper = ReceiverWrapper::local(
+                OrderedDrainProbe {
+                    receiver,
+                    feedback_before_drain,
+                },
+                test_node(runtime.config().name.clone()),
+                Arc::new(NodeUserConfig::new_receiver_config(
+                    "urn:otel:receiver:pending_drain",
+                )),
+                runtime.config(),
+            );
+            runtime
+                .set_receiver(wrapper)
+                .run_test(|_| async {})
+                .run_validation_concurrent(move |mut ctx| async move {
+                    tokio::time::timeout(Duration::from_secs(10), async {
+                        let pdata = ctx.recv().await.expect("pending page");
+                        ctx.send_control_msg(NodeControlMsg::DrainIngress {
+                            deadline: Instant::now() + Duration::from_secs(60),
+                            reason: "stop without downstream flush".into(),
+                        })
+                        .await
+                        .expect("drain");
+                        if feedback_before_drain.is_some() {
+                            let feedback = match feedback_kind {
+                                Ack => NodeControlMsg::Ack(next_ack(AckMsg::new(pdata)).unwrap().1),
+                                RetryableNack => NodeControlMsg::Nack(
+                                    next_nack(NackMsg::new("retry", pdata)).unwrap().1,
+                                ),
+                                PermanentNack => NodeControlMsg::Nack(
+                                    next_nack(NackMsg::new_permanent("reject", pdata))
+                                        .unwrap()
+                                        .1,
+                                ),
+                            };
+                            ctx.send_control_msg(feedback).await.expect("feedback");
+                        }
+                        cleanup_started
+                            .await
+                            .expect("cleanup starts without awaiting feedback");
+                        release_cleanup.send(()).expect("finish cleanup");
+                        assert!(ctx.recv().await.is_err(), "drain emits no further page");
+                    })
+                    .await
+                    .expect("drain and cleanup complete");
+                });
+            let expected = if feedback_before_drain == Some(true) && feedback_kind == Ack {
+                Some(CheckpointState {
+                    revision: previous.as_ref().map_or(1, |state| state.revision + 1),
+                    cursor: checkpoint(0, if saved { 42 } else { 1 }).cursor,
+                })
+            } else {
+                previous
+            };
+            assert_eq!(store.read().expect("checkpoint"), expected);
+            assert!(joined.get(), "adapter cleanup confirmed while lease held");
+            drop(SourceLease::acquire(store.lease_key()).expect("lease released after cleanup"));
+        }
+    }
 }
 
 #[async_trait(?Send)]
@@ -1451,15 +1646,14 @@ impl local::Receiver<OtapPdata> for CleanupBudgetProbe {
     }
 }
 
-/// Scenario: ACK, full-output, operation, checkpoint-write, or retry waits exhaust their stop allowance,
-/// or an ACK arrives before the cutoff.
+/// Scenario: A pending ACK stops immediately, while full-output, operation, checkpoint-write,
+/// or retry waits exhaust their stop allowance.
 /// Guarantees: Healthy adapter and scraper cleanup finish within the original deadline, retain ownership during cleanup,
 /// checkpoint only acknowledged progress, and allow reacquisition without a process restart.
 #[test]
 fn stop_wait_timeouts_reserve_cleanup_and_release_lease() {
     for (case, shutdown) in [
         (CleanupWaitCase::Ack, false),
-        (CleanupWaitCase::AckBeforeCutoff, false),
         (CleanupWaitCase::Send, false),
         (CleanupWaitCase::Operation, false),
         (CleanupWaitCase::Checkpoint, false),
@@ -1520,6 +1714,7 @@ fn stop_wait_timeouts_reserve_cleanup_and_release_lease() {
                 case,
                 executing: Rc::clone(&executing),
                 cleanup_started: Rc::clone(&cleanup_started),
+                cleanup_gate: None,
             },
             fake_query(&config),
             source,
@@ -1551,17 +1746,12 @@ fn stop_wait_timeouts_reserve_cleanup_and_release_lease() {
             .run_test(|_| async {})
             .run_validation_concurrent(move |mut ctx| async move {
                 tokio::time::timeout(Duration::from_secs(4), async {
-                    let mut pending_ack = None;
                     match case {
                         CleanupWaitCase::Ack
-                        | CleanupWaitCase::AckBeforeCutoff
                         | CleanupWaitCase::Checkpoint
                         | CleanupWaitCase::CheckpointRetry => {
                             let pdata = ctx.recv().await.expect("pending page");
-                            if matches!(case, CleanupWaitCase::AckBeforeCutoff) {
-                                pending_ack =
-                                    Some(next_ack(AckMsg::new(pdata)).expect("ACK subscription").1);
-                            } else if !matches!(case, CleanupWaitCase::Ack) {
+                            if !matches!(case, CleanupWaitCase::Ack) {
                                 let (_, ack) =
                                     next_ack(AckMsg::new(pdata)).expect("ACK subscription");
                                 ctx.send_control_msg(NodeControlMsg::Ack(ack))
@@ -1629,22 +1819,11 @@ fn stop_wait_timeouts_reserve_cleanup_and_release_lease() {
                         }
                     };
                     ctx.send_control_msg(message).await.expect("stop");
-                    if let Some(ack) = pending_ack {
-                        tokio::time::sleep(Duration::from_millis(50)).await;
-                        ctx.send_control_msg(NodeControlMsg::Ack(ack))
-                            .await
-                            .expect("ACK during drain");
-                    }
                     while !finished.get() {
                         tokio::task::yield_now().await;
                     }
                     let cleanup = observed_cleanup.get().expect("cleanup attempted");
-                    if matches!(case, CleanupWaitCase::AckBeforeCutoff) {
-                        assert!(
-                            cleanup < started + Duration::from_millis(500),
-                            "ACK completes drain without waiting for cutoff"
-                        );
-                    } else {
+                    if !matches!(case, CleanupWaitCase::Ack) {
                         assert!(
                             cleanup >= started + Duration::from_millis(450),
                             "{case:?}: wait allowance exhausted"
@@ -1666,15 +1845,7 @@ fn stop_wait_timeouts_reserve_cleanup_and_release_lease() {
             joined.get(),
             "{case:?}: cleanup confirmed with lease still held"
         );
-        let expected = if matches!(case, CleanupWaitCase::AckBeforeCutoff) {
-            CheckpointState {
-                revision: previous.revision + 1,
-                cursor: checkpoint(0, 42).cursor,
-            }
-        } else {
-            previous
-        };
-        assert_eq!(store.read().expect("checkpoint"), Some(expected));
+        assert_eq!(store.read().expect("checkpoint"), Some(previous));
         if matches!(
             case,
             CleanupWaitCase::Checkpoint | CleanupWaitCase::CheckpointRetry
@@ -3314,7 +3485,7 @@ fn run_catch_up_loop(case: LoopCase) {
                             );
                             pdata = ctx.recv().await.expect("replayed page");
                             assert_page_id(&pdata, page);
-                            assert_eq!(&*fetched.borrow(), &[0, 0], "NACK reuses committed cursor");
+                            assert_eq!(&*fetched.borrow(), &[0], "NACK reuses encoded bytes");
                         }
                         if case == LoopCase::HardPending {
                             ctx.send_control_msg(pressure(2, MemoryPressureLevel::Hard))
@@ -3362,7 +3533,6 @@ fn run_catch_up_loop(case: LoopCase) {
                     | LoopCase::OnePage => {
                         vec![0]
                     }
-                    LoopCase::NackReplay => vec![0, 0, 1, 2, 3],
                     _ => vec![0, 1, 2, 3],
                 };
                 while fetched.borrow().len() < expected_fetches.len() {

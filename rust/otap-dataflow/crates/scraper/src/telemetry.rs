@@ -38,6 +38,9 @@ pub struct DatabaseReceiverMetrics {
     /// Encoded OTLP bytes sent downstream.
     #[metric(unit = "By")]
     pub encoded_bytes_sent: Counter<u64>,
+    /// Encoded payload bytes retained for delivery, replay, and checkpoint completion.
+    #[metric(unit = "By")]
+    pub retained_bytes: Gauge<u64>,
     /// Records whose source event time cannot fit OTLP's timestamp range.
     #[metric(unit = "{record}")]
     pub event_time_fallbacks: Counter<u64>,

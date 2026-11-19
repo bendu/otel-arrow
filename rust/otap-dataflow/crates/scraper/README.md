@@ -223,8 +223,10 @@ An adapter can classify deterministic overflow as source-pausing: the receiver
 retains ownership and its checkpoint, emits nothing, and remains responsive to
 drain and shutdown while unrelated pipeline sources continue.
 
-NACKs, crashes before commit, and restarts re-execute the full query. Retries read
-the data available at that time; no historical result is retained. Unchanged rows
+Retryable NACKs replay the retained encoded snapshot, including its original
+observation timestamps, without querying again. Crashes before commit, restarts,
+and explicitly configured permanent-rejection retries re-execute the full query
+against current data; the replay buffer is not durable. Unchanged rows
 are emitted again on every interval, and changes between polls can be missed.
 This is periodic observation, not CDC, deduplication, or guaranteed replay of
 transient rows. The existing source lease, checkpoint identity checks, permanent
@@ -350,7 +352,7 @@ the polling controller manages when the store and lease are used.
 | `directory` | string | **required** | Non-empty path without `..` path components, as interpreted by the host platform. |
 | `on_nack` | string | **required** | Only `rewind` for retryable NACKs; permanent rejection uses the separate policy below. |
 | `on_permanent_nack` | string | `pause` | `pause` stops polling this source until repair and restart; opt-in `retry` uses capped backoff without advancing the checkpoint. |
-| `nack_backoff` | duration string | **required** | Between `1ms` and `5m`, inclusive. Fixed delay before replay. |
+| `nack_backoff` | duration string | **required** | Between `1ms` and `5m`, inclusive. Initial retryable-NACK delay; doubles per NACK up to the greater of this value and `30s`. |
 | `max_consecutive_failures` | integer | **required** | Between `1` and `1000`. Consecutive checkpoint-write failure limit, not a limit on all query or NACK retries. |
 
 ```yaml
@@ -614,6 +616,16 @@ memory limit. Protobuf still requires owned per-record keys and metadata; this
 is not zero-copy encoding. The exact serialized-byte ceiling and the cursor of
 the last emitted row are unchanged.
 
+The controller retains one pristine encoded payload and its candidate cursor
+until a matching ACK is durably checkpointed. Initial delivery and retryable-NACK
+replays share the immutable byte allocation; they do not retain normalized rows
+or run another encoding pass. The `retained_bytes` gauge accounts for these
+serialized bytes (at most `max_batch_bytes` per source), not context overhead,
+encoder scratch, downstream copies, or a process RSS ceiling. Enforced Hard
+pressure gates replay sends as well as new fetches and releases encoder scratch,
+but never silently discards the retained page. ACK/checkpoint completion remains
+available under pressure. Stopping releases the page without committing it.
+
 An optional cache-reuse microbenchmark compares a warmed encoder with the
 optimized one-shot API. Run it in isolation from the other tests:
 
@@ -695,7 +707,7 @@ Acquire source ownership and load committed position
 | --- | --- |
 | Downstream backpressure | Stop admitting more work rather than accumulating unbounded pages. |
 | Matching ACK | Advance progress only after checkpoint installation succeeds, subject to the filesystem guarantees below. |
-| Matching retryable NACK | Retain the checkpoint and replay after `nack_backoff`. |
+| Matching retryable NACK | Retain encoded bytes and the candidate; replay with a fresh attempt ID and capped exponential backoff starting at `nack_backoff`. |
 | Matching permanent NACK | Apply `on_permanent_nack`: pause by default or retry with capped backoff; keep the receiver alive, checkpoint unchanged, and lease held. |
 | Stale, malformed, or duplicate ACK/NACK | Discard and count as `stale_feedback`; stale permanent NACKs cannot pause collection or schedule replay. |
 | Crash after destination acceptance but before checkpoint commit | Allow replay; do not claim exactly-once delivery. |
@@ -707,6 +719,10 @@ Acquire source ownership and load committed position
 The runtime keeps one page pending per source. Multiple
 in-flight batches would additionally require a contiguous acknowledgement
 frontier; a later ACK must never skip an earlier unresolved batch.
+Each retryable NACK immediately invalidates its attempt ID, including during
+backoff. Late ACKs and duplicate NACKs cannot commit or reschedule the retained
+page. Only a matching ACK followed by durable checkpoint completion releases
+that page and resets retryable-NACK backoff.
 
 ### Permanent Rejection and Recovery
 
@@ -733,7 +749,7 @@ It never advances the checkpoint or skips the rejected rows.
 
 `retry` continues until delivery succeeds or the source is stopped; permanent
 rejections are not implicitly treated as transient failures. Both policies retain
-only bounded controller state, not an encoded-page replay buffer. Replay still
+only bounded controller state, discarding the encoded-page replay buffer. Replay still
 requires the documented source-retention and stable-row guarantees.
 
 The `database_receiver.source_paused` event explains operator recovery. For
@@ -803,7 +819,8 @@ both budgets permit it. When a cycle ends, the normal `interval` starts then.
 There is no separate opt-in or legacy scheduling mode; unresolved feedback still
 blocks another fetch.
 
-A retryable NACK ends the burst and uses `nack_backoff` without advancing the
+A retryable NACK ends the burst and replays retained bytes with capped exponential
+backoff starting at `nack_backoff`, without advancing the
 committed cursor, unless already recovering from a permanent rejection. A
 permanent NACK ends the burst and follows the configured pause/retry policy above.
 Transient query errors end immediate
@@ -860,8 +877,10 @@ Corrupt or incompatible checkpoints within that namespace fail explicitly.
 At-least-once behavior requires commit-visible cursor ordering, stable cursor
 and row values, and source retention longer than the expected outage and replay
 window. An increasing timestamp or sequence ID alone is insufficient: an older
-transaction can become visible after the checkpoint has advanced. NACK replay
-re-executes SQL and cannot reproduce rows that have changed or been deleted.
+transaction can become visible after the checkpoint has advanced. Live
+retryable-NACK replay preserves encoded rows even if the source changes, but
+restart and permanent-rejection retry re-execute SQL and cannot reproduce rows
+that have changed or been deleted.
 
 #### Checkpoint Ownership Is Not Database-Source Ownership
 
@@ -926,10 +945,21 @@ per-page threads or using Tokio's runtime-owned blocking pool.
 
 The controller continues processing control messages while work runs. On a stop
 request it reserves up to five seconds for cleanup, capped at half the remaining
-time before the supplied deadline. ACK, blocked-send, operation, and checkpoint
+time before the supplied deadline. Blocked-send, operation, and checkpoint
 waits end before that reservation starts. Checkpoint retries inherit the same
 cutoff; phase changes and repeated stop requests cannot extend it. Unacknowledged
 progress is not checkpointed and may replay after restart.
+
+A drain received while a sent page awaits ACK/NACK stops polling and begins
+cleanup immediately, without waiting for downstream feedback. Feedback handled
+before the drain can commit acknowledged progress; feedback queued after the
+drain is not processed. An already-started checkpoint write keeps the bounded
+stop behavior above. This avoids waiting for a downstream flush that engine
+shutdown cannot trigger until receivers report drained. Late completions are
+not kept alive by this receiver-local policy; shared engine support remains
+tracked in [#3849](https://github.com/open-telemetry/otel-arrow/issues/3849).
+Restart replay requires the source-retention guarantees documented above and
+can duplicate a page that downstream accepted without a committed checkpoint.
 
 Active-operation cancellation and checkpoint stop waits also retain their
 five-second cap. Final adapter and scraper-worker cleanup run concurrently,
@@ -979,6 +1009,7 @@ leases do not emit these runtime metrics by themselves.
 | `batches_sent`, `rows_sent`, `encoded_bytes_sent` | Admitted pages, records, and encoded bytes. |
 | `event_time_fallbacks` | Records whose event time cannot fit the OTLP timestamp range. |
 | `acks`, `nacks`, `replays`, `stale_feedback` | Matched downstream outcomes, scheduled NACK replays (not completed attempts), and rejected stale feedback. |
+| `retained_bytes` | Encoded bytes held for delivery, retryable-NACK replay, or checkpoint completion; bounded by `max_batch_bytes` per source. |
 | `checkpoint_commits`, `checkpoint_failures`, `checkpoint_cleanup_failures` | Durable progress and persistence/cleanup failures. |
 | `cancellations`, `drains`, `shutdowns` | Cancellation attempts and received drain/shutdown requests, including during checkpoint writes and retries; not counts of successful cleanup. |
 
