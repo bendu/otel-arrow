@@ -100,6 +100,16 @@ fn preserves_progress(context: PipelineContext, raw: Value, native_root: &std::p
         &validated.config.source_id,
         validated.fingerprint,
     );
+    #[cfg(target_os = "linux")]
+    if context.state_directory().is_some() {
+        otel_arrow_dfe_engine::testing::create_private_state_dir_test_namespace(
+            store
+                .lease_key()
+                .parent()
+                .expect("legacy checkpoint namespace"),
+        )
+        .expect("create private legacy checkpoint namespace");
+    }
     let (before, _) = store
         .write(0, &validated.common.watermark().initial())
         .unwrap();

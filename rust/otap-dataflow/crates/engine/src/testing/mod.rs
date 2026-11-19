@@ -62,6 +62,24 @@ pub fn state_dir_test_parent() -> std::path::PathBuf {
         .into()
 }
 
+/// Creates missing test namespace directories with private permissions.
+///
+/// Use beneath a trusted fixture root before native checkpoint seeding.
+/// Recursive creation applies mode 0700 to every missing ancestor, not just
+/// the leaf; existing directories are left unchanged.
+///
+/// # Errors
+///
+/// Returns filesystem errors encountered while creating the namespace.
+#[cfg(all(target_os = "linux", any(test, feature = "test-utils")))]
+pub fn create_private_state_dir_test_namespace(path: &std::path::Path) -> std::io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(path)
+}
+
 /// Creates fresh pipeline runtime services for one logical test pipeline.
 ///
 /// Tests that construct multiple effect handlers for the same pipeline should clone the returned

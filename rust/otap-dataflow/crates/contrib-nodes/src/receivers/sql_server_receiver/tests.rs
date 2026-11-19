@@ -1610,6 +1610,13 @@ mod factory {
             config.source_id(),
             config.config_fingerprint().to_owned(),
         );
+        otel_arrow_dfe_engine::testing::create_private_state_dir_test_namespace(
+            store
+                .lease_key()
+                .parent()
+                .expect("legacy checkpoint namespace"),
+        )
+        .expect("create private legacy checkpoint namespace");
         let (before, _) = store
             .write(0, &config.query().watermark().initial())
             .unwrap();

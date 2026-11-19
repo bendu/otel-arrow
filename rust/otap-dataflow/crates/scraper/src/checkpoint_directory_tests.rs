@@ -181,12 +181,18 @@ fn checkpoint_directory_pins_engine_namespace_and_preserves_progress() {
         "source",
         "fp".into(),
     );
+    otel_arrow_dfe_engine::testing::create_private_state_dir_test_namespace(
+        old.lease_key()
+            .parent()
+            .expect("legacy checkpoint namespace"),
+    )
+    .expect("create private legacy checkpoint namespace");
     let (before, _) = old
         .write(0, &Cursor::Scalar(ScalarValue::Int64(42)))
         .unwrap();
     let moved = base.join("moved");
     std::fs::rename(&root, &moved).unwrap();
-    std::fs::create_dir(&root).unwrap();
+    otel_arrow_dfe_engine::testing::create_private_state_dir_test_namespace(&root).unwrap();
     let current = CheckpointStore::from_config(
         "${engine.state_dir}/sql",
         &context,
@@ -267,7 +273,7 @@ fn checkpoint_directory_lease_survives_root_rename() {
 }
 
 /// Scenario: A configured suffix or identity namespace is a symlink outside the engine root.
-/// Guarantees: Managed construction refuses the link without opening or populating the target.
+/// Guarantees: Private parents let managed construction reject the symlink itself without populating its target.
 #[cfg(target_os = "linux")]
 #[test]
 fn checkpoint_directory_refuses_managed_symlinks() {
@@ -277,30 +283,29 @@ fn checkpoint_directory_refuses_managed_symlinks() {
     let root = base.join("state");
     let context = managed_context(&root);
     let outside = base.join("outside");
-    std::fs::create_dir(&outside).unwrap();
+    otel_arrow_dfe_engine::testing::create_private_state_dir_test_namespace(&outside).unwrap();
+    let assert_symlink_rejected = || {
+        let error = CheckpointStore::from_config(
+            "${engine.state_dir}/sql",
+            &context,
+            "receiver",
+            "source",
+            "fp".into(),
+        )
+        .expect_err("managed open must reject the symlink");
+        assert!(
+            matches!(&error, CheckpointDirectoryError::Io(source)
+                if matches!(source.raw_os_error(), Some(code)
+                    if code == libc::ENOTDIR || code == libc::ELOOP)),
+            "expected no-follow symlink error, got {error:?}"
+        );
+        assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 0);
+    };
     symlink(&outside, root.join("sql")).unwrap();
-    assert!(
-        CheckpointStore::from_config(
-            "${engine.state_dir}/sql",
-            &context,
-            "receiver",
-            "source",
-            "fp".into(),
-        )
-        .is_err()
-    );
+    assert_symlink_rejected();
     std::fs::remove_file(root.join("sql")).unwrap();
-    std::fs::create_dir(root.join("sql")).unwrap();
+    otel_arrow_dfe_engine::testing::create_private_state_dir_test_namespace(&root.join("sql"))
+        .unwrap();
     symlink(&outside, root.join("sql").join("@v1")).unwrap();
-    assert!(
-        CheckpointStore::from_config(
-            "${engine.state_dir}/sql",
-            &context,
-            "receiver",
-            "source",
-            "fp".into(),
-        )
-        .is_err()
-    );
-    assert_eq!(std::fs::read_dir(outside).unwrap().count(), 0);
+    assert_symlink_rejected();
 }
