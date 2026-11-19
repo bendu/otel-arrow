@@ -109,10 +109,23 @@ fn checkpoint_directory_preserves_native_locations() {
 }
 
 #[cfg(target_os = "linux")]
+fn managed_fixture() -> tempfile::TempDir {
+    use std::os::unix::fs::PermissionsExt;
+    let directory = tempfile::Builder::new()
+        .prefix("otap-checkpoint-test-")
+        .tempdir_in(otel_arrow_dfe_engine::testing::state_dir_test_parent())
+        .expect("create state fixture beneath trusted test parent");
+    std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    directory
+}
+
+#[cfg(target_os = "linux")]
 fn managed_context(path: &Path) -> PipelineContext {
     use otel_arrow_dfe_engine::state_dir::StateDirectory;
     ControllerContext::new(TelemetryRegistryHandle::new())
-        .with_state_directory(StateDirectory::provision(path).expect("trusted state root"))
+        .with_state_directory(
+            StateDirectory::provision(path).expect("test parent must have trusted ancestors"),
+        )
         .pipeline_context_with("group".into(), "pipeline".into(), 0, 1, 0)
 }
 
@@ -121,7 +134,7 @@ fn managed_context(path: &Path) -> PipelineContext {
 #[cfg(target_os = "linux")]
 #[test]
 fn checkpoint_directory_does_not_rebase_explicit_paths() {
-    let directory = tempfile::tempdir_in(".").unwrap();
+    let directory = managed_fixture();
     let base = directory.path().canonicalize().unwrap();
     let root = base.join("managed");
     let context = managed_context(&root);
@@ -155,7 +168,7 @@ fn checkpoint_directory_does_not_rebase_explicit_paths() {
 #[cfg(target_os = "linux")]
 #[test]
 fn checkpoint_directory_pins_engine_namespace_and_preserves_progress() {
-    let directory = tempfile::tempdir_in(".").unwrap();
+    let directory = managed_fixture();
     let base = directory.path().canonicalize().unwrap();
     let root = base.join("state");
     let context = managed_context(&root);
@@ -210,7 +223,7 @@ fn checkpoint_directory_pins_engine_namespace_and_preserves_progress() {
 #[test]
 fn checkpoint_directory_refuses_managed_symlinks() {
     use std::os::unix::fs::symlink;
-    let directory = tempfile::tempdir_in(".").unwrap();
+    let directory = managed_fixture();
     let base = directory.path().canonicalize().unwrap();
     let root = base.join("state");
     let context = managed_context(&root);

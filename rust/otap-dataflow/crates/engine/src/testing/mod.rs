@@ -44,6 +44,24 @@ pub mod receiver;
 
 pub use node::{test_node, test_nodes};
 
+/// Selects the parent for private Linux state-directory test fixtures.
+///
+/// Shared temporary directories such as /tmp are intentionally not trusted.
+/// Callers must create a private 0700 directory and provision the real state
+/// root to validate that the selected parent has trusted ancestors.
+///
+/// # Panics
+///
+/// Panics if neither `OTAP_STATE_DIR_TEST_PARENT` nor `HOME` is set.
+#[cfg(all(target_os = "linux", any(test, feature = "test-utils")))]
+#[must_use]
+pub fn state_dir_test_parent() -> std::path::PathBuf {
+    std::env::var_os("OTAP_STATE_DIR_TEST_PARENT")
+        .or_else(|| std::env::var_os("HOME"))
+        .expect("set OTAP_STATE_DIR_TEST_PARENT to a trusted test directory")
+        .into()
+}
+
 /// Creates fresh pipeline runtime services for one logical test pipeline.
 ///
 /// Tests that construct multiple effect handlers for the same pipeline should clone the returned

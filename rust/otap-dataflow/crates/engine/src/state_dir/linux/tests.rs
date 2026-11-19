@@ -11,14 +11,9 @@ use std::process::{Command, Stdio};
 use tempfile::TempDir;
 
 fn fixture() -> TempDir {
-    // /tmp is intentionally not trusted. Tests require a private tree beneath
-    // trusted ancestors, just like production. The override supports test VMs.
-    let parent = std::env::var_os("OTAP_STATE_DIR_TEST_PARENT")
-        .or_else(|| std::env::var_os("HOME"))
-        .expect("set OTAP_STATE_DIR_TEST_PARENT to a trusted test directory");
     let temp = tempfile::Builder::new()
         .prefix("otap-state-test-")
-        .tempdir_in(parent)
+        .tempdir_in(crate::testing::state_dir_test_parent())
         .unwrap();
     std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     let _ =

@@ -119,10 +119,17 @@ fn preserves_progress(context: PipelineContext, raw: Value, native_root: &std::p
 #[test]
 fn factory_checkpoint_directory_uses_engine_root() {
     use otel_arrow_dfe_engine::state_dir::StateDirectory;
-    let directory = tempfile::tempdir_in(".").unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    let directory = tempfile::Builder::new()
+        .prefix("otap-postgresql-checkpoint-test-")
+        .tempdir_in(otel_arrow_dfe_engine::testing::state_dir_test_parent())
+        .expect("create state fixture beneath trusted test parent");
+    std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     let root = directory.path().canonicalize().unwrap().join("state");
     let context = ControllerContext::new(TelemetryRegistryHandle::new())
-        .with_state_directory(StateDirectory::provision(&root).unwrap())
+        .with_state_directory(
+            StateDirectory::provision(&root).expect("test parent must have trusted ancestors"),
+        )
         .pipeline_context_with("group".into(), "pipeline".into(), 0, 1, 0);
     let mut raw = config(&sql(KEY));
     raw["checkpoint"]["directory"] = json!("${engine.state_dir}/postgresql");
