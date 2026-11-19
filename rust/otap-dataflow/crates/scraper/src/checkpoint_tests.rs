@@ -89,6 +89,108 @@ fn store(root: &Path, fingerprint: &str) -> CheckpointStore {
     )
 }
 
+/// Scenario: Public construction expands the legacy prefix with unset, custom, empty, or native-byte roots.
+/// Guarantees: Native joins select the original acknowledged checkpoint; ordinary native arguments stay unchanged.
+#[test]
+fn legacy_constructor_preserves_checkpoint_progress() {
+    const CASE: &str = "OTAP_CHECKPOINT_LEGACY_CONSTRUCTOR_CASE";
+    const EXPECTED: &str = "OTAP_CHECKPOINT_LEGACY_EXPECTED_ROOT";
+    if let Some(case) = std::env::var_os(CASE) {
+        let expected = PathBuf::from(std::env::var_os(EXPECTED).expect("expected native root"));
+        for suffix in ["", "oracle", "postgresql"] {
+            let native = store(&expected.join(suffix), "fingerprint");
+            let legacy = store(
+                &Path::new("${engine.state_dir}").join(suffix),
+                "fingerprint",
+            );
+            assert_eq!(legacy.lease_key(), native.lease_key());
+            // Root joins must not become UNC paths on Windows. Do not write to
+            // the real filesystem root to check this path-selection contract.
+            if case == "root" {
+                continue;
+            }
+            let (acknowledged, _) = native
+                .write(0, &cursor("2026-01-01 00:00:00", 42))
+                .expect("seed existing checkpoint");
+            assert_eq!(
+                legacy.read().expect("legacy checkpoint"),
+                Some(acknowledged)
+            );
+        }
+        for native_root in [
+            Path::new(""),
+            Path::new("native"),
+            Path::new("${engine.state_dir}suffix"),
+        ] {
+            let native = store(native_root, "fingerprint");
+            assert_eq!(
+                native.lease_key(),
+                native_root
+                    .join("@v1")
+                    .join(encode_identity_segment("group"))
+                    .join(encode_identity_segment("pipeline"))
+                    .join(encode_identity_segment("oracle-audit"))
+                    .join(format!("{}.checkpoint", encode_identity_segment("orders")))
+            );
+        }
+        return;
+    }
+
+    let directory = tempfile::tempdir().expect("isolated working directory");
+    let base = directory.path().canonicalize().unwrap();
+    let custom = base.join("custom-\u{e9}");
+    let trailing_root = base.join("trailing-\u{e9}");
+    let mut trailing = trailing_root.clone().into_os_string();
+    trailing.push(std::path::MAIN_SEPARATOR_STR);
+    let mut cases = vec![
+        ("unset", None, PathBuf::from(".otap-state")),
+        (
+            "custom",
+            Some(custom.clone().into_os_string()),
+            custom.clone(),
+        ),
+        ("empty", Some(std::ffi::OsString::new()), PathBuf::new()),
+        ("trailing", Some(trailing), trailing_root),
+        (
+            "root",
+            Some(std::ffi::OsString::from("/")),
+            PathBuf::from("/"),
+        ),
+    ];
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStringExt;
+        let root = base.join(std::ffi::OsString::from_vec(b"native-\xff".to_vec()));
+        cases.push(("non-utf8", Some(root.clone().into_os_string()), root));
+    }
+    for (case, value, expected) in cases.drain(..) {
+        let working = base.join(case);
+        std::fs::create_dir(&working).unwrap();
+        let mut command = Command::new(std::env::current_exe().expect("test executable"));
+        let _ = command
+            .args([
+                "--exact",
+                "checkpoint::tests::legacy_constructor_preserves_checkpoint_progress",
+                "--test-threads=1",
+                "--nocapture",
+            ])
+            .current_dir(working)
+            .env(CASE, case)
+            .env(EXPECTED, expected)
+            .env_remove("OTAP_DF_STATE_DIR");
+        if let Some(value) = value {
+            let _ = command.env("OTAP_DF_STATE_DIR", value);
+        }
+        let output = command.output().expect("legacy constructor child");
+        assert!(
+            output.status.success(),
+            "{case}: {}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
 /// Scenario: A source ID makes the serialized checkpoint exceed the read ceiling.
 /// Guarantees: The write fails before creating directories or installing unreadable state.
 #[test]

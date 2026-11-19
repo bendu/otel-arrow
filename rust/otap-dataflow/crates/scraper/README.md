@@ -394,8 +394,50 @@ path, or configure the exact existing parent as `engine.state_dir` if it meets
 the engine's trust requirements. Include the same suffix as before. Do not select
 a new root unless intentionally selecting different state. Existing checkpoint
 layout, source identity, fingerprints, and cursor values are unchanged; no
-automatic relocation, copying, or reset is performed. The console examples make
-the legacy environment/default selection explicit in their configuration.
+automatic relocation, copying, or reset is performed.
+
+The public Rust `CheckpointStore::new` constructor retains its legacy behavior:
+an exact `${engine.state_dir}` path prefix uses native `OTAP_DF_STATE_DIR`, or
+`.otap-state` only when that variable is unset, then joins the suffix as a native
+path. Empty and non-UTF8 environment values retain their native path meaning.
+Other native arguments, including an empty path, are unchanged. Receiver
+configuration uses `from_config` instead and never takes that ambient fallback.
+
+##### Console example migration
+
+**Intentional configuration compatibility change:** `postgresql-console.yaml`
+and `oracle-oci-console.yaml` (also embedded in the Oracle README) now require
+`POSTGRESQL_CHECKPOINT_DIRECTORY` and `ORACLE_CHECKPOINT_DIRECTORY`,
+respectively. Each setting is the **complete explicit checkpoint directory**;
+there is no default and no suffix is appended. Supplying only the old
+`OTAP_DF_STATE_DIR` now fails loading with a missing-setting error. An empty
+setting fails receiver checkpoint validation before database work. A non-UTF8
+setting fails the configuration loader with an invalid-Unicode error rather
+than falling back or converting the path lossily.
+
+Before upgrading an example, stop the receiver and set the new variable to its
+exact previous checkpoint location. Compute the old location with native path
+operations, as the legacy constructor does:
+
+```rust
+use std::path::PathBuf;
+
+let base = std::env::var_os("OTAP_DF_STATE_DIR")
+    .map(PathBuf::from)
+    .unwrap_or_else(|| PathBuf::from(".otap-state"));
+let postgresql_directory = base.join("postgresql");
+let oracle_directory = base.join("oracle");
+```
+
+Do not substitute shell string concatenation: an empty base joins to the
+relative `postgresql` or `oracle` directory, not a filesystem-root directory.
+Native joining also preserves non-UTF8 bytes, which cannot be represented by
+these text configuration settings; do not silently replace such bytes or use
+the default. Existing native Rust callers retain support for those paths.
+Keep the same working directory for a relative location, or resolve that
+existing location to an absolute path before configuring the new setting.
+Normal explicit native paths preserve acknowledged progress without moving or
+resetting checkpoints.
 
 ### Output Configuration
 

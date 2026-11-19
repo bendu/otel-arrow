@@ -63,9 +63,16 @@ This reference describes the YAML accepted by the OTEL-Arrow engine.
 
 See [checkpoint directory selection and migration](../../../../scraper/README.md#checkpoint-directory-selection)
 before adopting `${engine.state_dir}`. Explicit native paths retain their
-locations. The example below explicitly selects `OTAP_DF_STATE_DIR` or
-`.otap-state`; use an absolute persistent path to survive working-directory
-changes. On Windows, use an explicit native checkpoint path.
+locations.
+
+**Console example migration:** The example below and `oracle-oci-console.yaml`
+now require `ORACLE_CHECKPOINT_DIRECTORY` to contain the complete existing
+checkpoint directory, including the `oracle` suffix if previously used. There
+is no default or appended suffix. `OTAP_DF_STATE_DIR` alone now fails with a
+missing-setting error instead of selecting another checkpoint location. Use
+[native path joining for the previous location](../../../../scraper/README.md#console-example-migration),
+not shell string concatenation. Prefer an absolute persistent path to survive
+working-directory changes. On Windows, use an explicit native checkpoint path.
 
 Configure database connectivity, one query, its composite watermark, and
 checkpoint behavior in the receiver's `config` block. Configure credential
@@ -690,7 +697,9 @@ the environment in the service or container that actually starts the engine.
 
 The repository provides this single-core Oracle-to-console pipeline in
 [`configs/oracle-oci-console.yaml`][example-config]. Environment substitutions
-refer to connection settings and secret **paths**, not secret contents.
+refer to connection settings, the complete checkpoint directory, and secret
+**paths**, not secret contents. Set `ORACLE_CHECKPOINT_DIRECTORY` explicitly;
+there is no default or appended suffix.
 
 ```yaml
 version: otel_dataflow/v1
@@ -750,7 +759,7 @@ groups:
                   bind: last_tie_breaker
                   initial: 0
               checkpoint:
-                directory: '${env:OTAP_DF_STATE_DIR:-.otap-state}/oracle'
+                directory: '${env:ORACLE_CHECKPOINT_DIRECTORY}'
                 on_nack: rewind
                 nack_backoff: 1s
                 max_consecutive_failures: 5
@@ -778,6 +787,7 @@ $env:ORACLE_INSTANT_CLIENT_DIR = "C:\oracle\instantclient"
 $env:PATH = "$env:ORACLE_INSTANT_CLIENT_DIR;$env:PATH"
 $env:ORACLE_CONNECT_STRING = "//database.example.com:1521/ORCL"
 $env:ORACLE_PASSWORD_FILE = "C:\secrets\oracle-password"
+$env:ORACLE_CHECKPOINT_DIRECTORY = ".otap-state\oracle"
 cargo run --no-default-features --features crypto-ring,oracle -- `
   --config configs\oracle-oci-console.yaml --num-cores 1
 ```
@@ -790,9 +800,14 @@ export ORACLE_INSTANT_CLIENT_DIR=/opt/oracle/instantclient
 export LD_LIBRARY_PATH="$ORACLE_INSTANT_CLIENT_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 export ORACLE_CONNECT_STRING=//database.example.com:1521/ORCL
 export ORACLE_PASSWORD_FILE=/run/oracle-secrets/password
+export ORACLE_CHECKPOINT_DIRECTORY=.otap-state/oracle
 cargo run --no-default-features --features crypto-ring,oracle -- \
   --config configs/oracle-oci-console.yaml --num-cores 1
 ```
+
+The checkpoint paths above are explicit choices for a new installation.
+For an existing installation, replace them with the exact previous location
+using the [migration guidance](../../../../scraper/README.md#console-example-migration).
 
 The runtime rejects multi-core placement for this unpartitioned receiver.
 The `crypto-ring` build feature selects the engine's TLS provider; it does not

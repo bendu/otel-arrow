@@ -19,4 +19,4 @@ issues: [4110, 4138]
 # section with the specific action consumers must take. Keep notes to 200
 # characters and subtext to 300 characters.
 subtext: |
-  Migration: Set checkpoint.directory to its existing native path, or configure the same existing root as engine.state_dir on Linux. No checkpoints are moved or reset. Console examples explicitly retain OTAP_DF_STATE_DIR and .otap-state selection.
+  Migration: Keep existing checkpoint paths or configure engine.state_dir on Linux. Console examples require POSTGRESQL_CHECKPOINT_DIRECTORY or ORACLE_CHECKPOINT_DIRECTORY set to the full previous native-joined path. OTAP_DF_STATE_DIR alone now errors; no defaults, moves, or resets.

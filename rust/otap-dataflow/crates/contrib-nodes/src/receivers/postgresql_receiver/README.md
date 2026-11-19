@@ -27,11 +27,18 @@ docker compose --file crates/contrib-nodes/src/receivers/postgresql_receiver/fix
 
 The fixture writes the username, password, and CA to its `out` directory.
 
-Run the receiver:
+For a new disposable walkthrough, explicitly select its complete checkpoint
+directory, then run the receiver. For an existing installation, first follow
+the [console example migration](../../../../scraper/README.md#console-example-migration)
+and use its exact previous location instead:
 
 ```sh
+export POSTGRESQL_CHECKPOINT_DIRECTORY=.otap-state/postgresql
 cargo run --no-default-features --features postgresql,crypto-ring --bin df_engine -- --config configs/postgresql-console.yaml
 ```
+
+In PowerShell, use `$env:POSTGRESQL_CHECKPOINT_DIRECTORY = '.otap-state\postgresql'`
+instead of `export`.
 
 No OTLP endpoint is needed. The console emits three OTLP logs shaped like:
 
@@ -355,8 +362,15 @@ For checkpoint path compatibility, see
 [directory selection and migration](../../../../scraper/README.md#checkpoint-directory-selection).
 Explicit native paths are unchanged. `${engine.state_dir}` requires a configured
 Linux engine root and never falls back to `OTAP_DF_STATE_DIR` or `.otap-state`.
-The console example makes that legacy environment/default selection explicit;
-use an absolute persistent path if the working directory can change.
+
+**Console example migration:** `postgresql-console.yaml` now requires
+`POSTGRESQL_CHECKPOINT_DIRECTORY` to contain the complete existing checkpoint
+directory, including the `postgresql` suffix if previously used. There is no
+default or appended suffix. `OTAP_DF_STATE_DIR` alone now fails with a
+missing-setting error rather than silently selecting a new location. Follow
+[native path joining for the previous location](../../../../scraper/README.md#console-example-migration),
+not shell string concatenation; prefer an absolute persistent path if the
+working directory can change.
 
 Timestamp cursors require `timestamp`/`timestamptz`; composite additionally
 requires `timezone: UTC` in its timestamp block.

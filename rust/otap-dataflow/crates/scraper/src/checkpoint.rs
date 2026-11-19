@@ -344,10 +344,38 @@ impl CheckpointError {
 impl CheckpointStore {
     /// Builds a store whose path encodes the exact pipeline and source IDs.
     ///
-    /// `root` is a native path, not a configuration expression. Receivers must
-    /// use [`Self::from_config`] to resolve engine-owned checkpoint directories.
+    /// For compatibility, an exact `${engine.state_dir}` path prefix expands
+    /// using the native `OTAP_DF_STATE_DIR` value, or `.otap-state` when unset.
+    /// All other native paths are unchanged, including empty paths.
+    /// Receivers must use [`Self::from_config`] for engine-owned storage without
+    /// this legacy environment/default fallback.
     #[must_use]
     pub fn new(
+        root: &Path,
+        pipeline_group_id: &str,
+        pipeline_id: &str,
+        receiver_name: &str,
+        source_id: &str,
+        config_fingerprint: String,
+    ) -> Self {
+        let root = match root.strip_prefix("${engine.state_dir}") {
+            Ok(suffix) => std::env::var_os("OTAP_DF_STATE_DIR")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from(".otap-state"))
+                .join(suffix),
+            Err(_) => root.to_path_buf(),
+        };
+        Self::new_native(
+            &root,
+            pipeline_group_id,
+            pipeline_id,
+            receiver_name,
+            source_id,
+            config_fingerprint,
+        )
+    }
+
+    fn new_native(
         root: &Path,
         pipeline_group_id: &str,
         pipeline_id: &str,

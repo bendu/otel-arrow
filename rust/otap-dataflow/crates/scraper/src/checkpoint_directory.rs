@@ -64,7 +64,7 @@ impl CheckpointStore {
         validate_directory(directory)?;
         let path = Path::new(directory);
         let managed = path.strip_prefix(ENGINE_ROOT).ok();
-        let mut store = Self::new(
+        let mut store = Self::new_native(
             managed.unwrap_or(path),
             pipeline.pipeline_group_id().as_ref(),
             pipeline.pipeline_id().as_ref(),

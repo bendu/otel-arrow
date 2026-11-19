@@ -1,6 +1,9 @@
 // Copyright The OpenTelemetry Authors
 // SPDX-License-Identifier: Apache-2.0
 
+#[cfg(all(test, any(feature = "postgresql", feature = "oracle")))]
+mod checkpoint_example_tests;
+
 /// ETW (Event Tracing for Windows) receiver.
 #[cfg(all(feature = "etw", target_os = "windows"))]
 pub mod etw_receiver;
