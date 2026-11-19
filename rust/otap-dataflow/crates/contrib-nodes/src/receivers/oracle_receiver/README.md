@@ -853,7 +853,8 @@ describe receiver activity, not database monitoring metrics.
 
 #### `receiver.database`
 
-Metrics are counters except for the rejection-pause gauge, with no custom measurement attributes.
+Metrics are counters except for the retained-bytes and rejection-pause gauges,
+with no custom measurement attributes.
 Common engine resource and node context may still accompany them.
 
 | Metric | Unit | Description |
@@ -865,6 +866,7 @@ Common engine resource and node context may still accompany them.
 | `receiver.database.batches_sent` | `{batch}` | Pages sent downstream. |
 | `receiver.database.rows_sent` | `{row}` | Rows sent downstream. |
 | `receiver.database.encoded_bytes_sent` | `By` | Encoded OTLP bytes sent downstream. |
+| `receiver.database.retained_bytes` | `By` | Gauge: encoded payload bytes retained for delivery, replay, and checkpoint completion; not a process-memory ceiling. |
 | `receiver.database.event_time_fallbacks` | `{record}` | Records using observation time because source time is outside OTLP's range. |
 | `receiver.database.acks` | `{ack}` | Matching downstream ACKs; not necessarily successful checkpoint commits. |
 | `receiver.database.nacks` | `{nack}` | Matching downstream NACKs. |
@@ -894,7 +896,8 @@ Common engine resource and node context may still accompany them.
 | `database_receiver.checkpoint_failed` | `warn` | Checkpoint write failed; includes attempt count. |
 | `database_receiver.checkpoint_cleanup_failed` | `warn` | Stale revisions could not be removed. |
 | `database_receiver.event_time_fallback` | `warn` | Source event time required an observation-time fallback. |
-| `database_receiver.drain_deadline_reached` | `warn` | Drain deadline reached during unresolved delivery. |
+| `database_receiver.pending_page_deferred` | `info` | Drain stops without waiting for downstream feedback; unacknowledged progress may replay after restart. |
+| `database_receiver.drain_wait_expired` | `warn` | Downstream send wait ended to reserve worker cleanup time. |
 | `database_receiver.cancellation_failed` | `warn` | An active operation could not be interrupted. |
 | `database_receiver.worker_abandoned` | `warn` | Worker cleanup could not be joined; ownership retained until process exit. |
 
