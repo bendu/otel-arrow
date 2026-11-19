@@ -56,7 +56,8 @@ groups:
                   bind: last_tie_breaker
                   initial: 0
               checkpoint:
-                directory: '${env:ORACLE_CHECKPOINT_DIRECTORY}'
+                # REQUIRED: edit to the exact full checkpoint path; see receiver migration docs.
+                directory: ''
                 on_nack: rewind
                 on_permanent_nack: pause
                 nack_backoff: 1s

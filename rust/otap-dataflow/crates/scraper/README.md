@@ -373,8 +373,9 @@ Configure an explicit absolute `engine.state_dir` on Linux before using, for
 example, `directory: '${engine.state_dir}/postgresql'`. A missing engine root is
 a startup error, not an instruction to look up `OTAP_DF_STATE_DIR` or use
 `.otap-state`. Other unresolved `${...}` expressions are configuration errors.
-The normal configuration loader can expand explicit `${env:NAME}` expressions
-before receiver validation.
+The normal configuration loader expands environment expressions before YAML
+parsing. Do not interpolate raw native checkpoint paths into YAML: quotes in an
+environment value can change the parsed path without a configuration error.
 
 Managed storage retains directory descriptors, refuses symlink descendants,
 and requires descendant directories owned by the collector UID without
@@ -406,18 +407,16 @@ configuration uses `from_config` instead and never takes that ambient fallback.
 ##### Console example migration
 
 **Intentional configuration compatibility change:** `postgresql-console.yaml`
-and `oracle-oci-console.yaml` (also embedded in the Oracle README) now require
-`POSTGRESQL_CHECKPOINT_DIRECTORY` and `ORACLE_CHECKPOINT_DIRECTORY`,
-respectively. Each setting is the **complete explicit checkpoint directory**;
-there is no default and no suffix is appended. Supplying only the old
-`OTAP_DF_STATE_DIR` now fails loading with a missing-setting error. An empty
-setting fails receiver checkpoint validation before database work. A non-UTF8
-setting fails the configuration loader with an invalid-Unicode error rather
-than falling back or converting the path lossily.
+and `oracle-oci-console.yaml` (also embedded in the Oracle README) now ship with
+an intentionally empty `checkpoint.directory: ''`. Startup receiver validation
+fails before database work until the operator **edits the YAML** to supply the
+complete, exact previous checkpoint path as a literal. Environment settings,
+including `OTAP_DF_STATE_DIR`, do not replace this marker. There is no default,
+appended suffix, automatic move, or reset.
 
-Before upgrading an example, stop the receiver and set the new variable to its
-exact previous checkpoint location. Compute the old location with native path
-operations, as the legacy constructor does:
+Before upgrading an example, stop the receiver and identify its exact previous
+checkpoint location. Compute the old location with native path operations,
+as the legacy constructor does:
 
 ```rust
 use std::path::PathBuf;
@@ -431,13 +430,37 @@ let oracle_directory = base.join("oracle");
 
 Do not substitute shell string concatenation: an empty base joins to the
 relative `postgresql` or `oracle` directory, not a filesystem-root directory.
-Native joining also preserves non-UTF8 bytes, which cannot be represented by
-these text configuration settings; do not silently replace such bytes or use
-the default. Existing native Rust callers retain support for those paths.
+Native joining also avoids changing filesystem-root or trailing-separator
+semantics. YAML configuration accepts Unicode text, not arbitrary native path
+bytes. Non-UTF8 paths cannot be represented here; do not replace bytes lossily
+or select a fallback. Existing native Rust callers retain support for those paths.
 Keep the same working directory for a relative location, or resolve that
-existing location to an absolute path before configuring the new setting.
-Normal explicit native paths preserve acknowledged progress without moving or
-resetting checkpoints.
+existing location to an absolute path before editing the YAML.
+
+Quote the literal using YAML rules, not shell quoting. In a YAML single-quoted
+scalar, each literal apostrophe must be doubled: native `reader's` is written
+`'reader''s'`; a native pair of apostrophes in `pair''dir` requires four in the
+YAML content, `'pair''''dir'`. An unescaped pair in single-quoted YAML instead
+becomes one apostrophe and can silently select a different checkpoint.
+Single quotes preserve native Windows backslashes; double-quoted YAML requires
+backslash escaping. For example:
+
+```yaml
+# Native Windows path: C:\state\pair''dir $cash
+directory: 'C:\state\pair''''dir $$cash'
+```
+
+The generic loader processes dollars before YAML, even inside single quotes:
+write `$$` for each literal `$` (for example `$$cash` becomes `$cash`). This is a
+separate escaping layer from YAML quoting. `$${...}` reaches receiver validation
+as literal `${...}`, which is rejected as an unsupported placeholder unless it
+is the supported engine-root prefix. Placeholder-shaped native filenames are
+therefore not supported in these checkpoint settings.
+
+Do not inject raw environment values into a quoted YAML scalar. For generated
+configuration, escape literal dollars for the loader and serialize the path
+with a YAML serializer. Correctly escaped explicit native paths preserve
+acknowledged progress and the original exclusive lease without relocation.
 
 ### Output Configuration
 

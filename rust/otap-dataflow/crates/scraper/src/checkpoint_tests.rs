@@ -90,7 +90,7 @@ fn store(root: &Path, fingerprint: &str) -> CheckpointStore {
 }
 
 /// Scenario: Public construction expands the legacy prefix with unset, custom, empty, or native-byte roots.
-/// Guarantees: Native joins select the original acknowledged checkpoint; ordinary native arguments stay unchanged.
+/// Guarantees: Native joins select the original cursor and exclusive lease generation; ordinary native arguments stay unchanged.
 #[test]
 fn legacy_constructor_preserves_checkpoint_progress() {
     const CASE: &str = "OTAP_CHECKPOINT_LEGACY_CONSTRUCTOR_CASE";
@@ -112,8 +112,26 @@ fn legacy_constructor_preserves_checkpoint_progress() {
             let (acknowledged, _) = native
                 .write(0, &cursor("2026-01-01 00:00:00", 42))
                 .expect("seed existing checkpoint");
+            let native_lease = SourceLease::acquire(native.lease_key()).expect("hold native lease");
+            let generation = native_lease.generation();
             assert_eq!(
                 legacy.read().expect("legacy checkpoint"),
+                Some(acknowledged.clone())
+            );
+            assert!(matches!(
+                SourceLease::acquire(legacy.lease_key()),
+                Err(LeaseError::AlreadyOwned)
+            ));
+            drop(native_lease);
+            let legacy_lease =
+                SourceLease::acquire(legacy.lease_key()).expect("resume legacy ownership");
+            assert_eq!(legacy_lease.generation(), generation + 1);
+            assert!(matches!(
+                SourceLease::acquire(native.lease_key()),
+                Err(LeaseError::AlreadyOwned)
+            ));
+            assert_eq!(
+                legacy.read().expect("progress after lease reacquisition"),
                 Some(acknowledged)
             );
         }

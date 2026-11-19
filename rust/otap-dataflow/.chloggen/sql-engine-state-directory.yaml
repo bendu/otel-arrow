@@ -19,4 +19,4 @@ issues: [4110, 4138]
 # section with the specific action consumers must take. Keep notes to 200
 # characters and subtext to 300 characters.
 subtext: |
-  Migration: Keep existing checkpoint paths or configure engine.state_dir on Linux. Console examples require POSTGRESQL_CHECKPOINT_DIRECTORY or ORACLE_CHECKPOINT_DIRECTORY set to the full previous native-joined path. OTAP_DF_STATE_DIR alone now errors; no defaults, moves, or resets.
+  Migration: Keep existing paths or configure engine.state_dir on Linux. Console examples ship with empty checkpoint paths: edit YAML to the exact previous full path using YAML quote and loader dollar escaping. Environment settings cannot fill the marker; no defaults, moves, or resets.
