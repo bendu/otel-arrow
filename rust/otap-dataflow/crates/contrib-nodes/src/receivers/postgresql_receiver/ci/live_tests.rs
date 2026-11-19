@@ -124,6 +124,9 @@ async fn live_verified_tls_polling_modes() {
             loop {
                 _ = adapter.begin_operation().expect("page operation");
                 let page = adapter.execute(&query, &cursor).await.expect("native page");
+                if mode == "snapshot" || page.rows.is_empty() {
+                    assert_eq!(page.completion, QueryCompletion::Complete);
+                }
                 if page.rows.is_empty() {
                     break;
                 }

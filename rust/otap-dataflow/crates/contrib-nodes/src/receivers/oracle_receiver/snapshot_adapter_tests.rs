@@ -65,8 +65,8 @@ fn snapshot_limit_is_not_retryable() {
     assert!(normalized.contains("10 complete rows"));
 }
 
-/// Scenario: Live Oracle returns an exact-fit result, one extra row, or too many normalized bytes.
-/// Guarantees: Snapshot fetching accepts complete results and fails before returning a truncated row or byte prefix.
+/// Scenario: Live Oracle returns empty, exact-fit, extra-row, or oversized normalized results.
+/// Guarantees: Only exhausted snapshots are complete; overflow fails without returning a row or byte prefix.
 #[tokio::test]
 #[ignore = "requires ORACLE_SNAPSHOT_TEST_CONFIG, ORACLE_USERNAME, and ORACLE_PASSWORD_FILE"]
 async fn live_snapshot_bounds_are_all_or_nothing() -> Result<(), Box<dyn std::error::Error>> {
@@ -77,6 +77,12 @@ async fn live_snapshot_bounds_are_all_or_nothing() -> Result<(), Box<dyn std::er
         &std::env::var("ORACLE_PASSWORD_FILE")?,
     );
     for (sql, max_rows, bytes, expected_rows) in [
+        (
+            "SELECT CAST(NULL AS VARCHAR2(10)) AS PAYLOAD FROM DUAL WHERE 1 = 0",
+            1,
+            4096,
+            Some(0),
+        ),
         (
             "SELECT CAST(NULL AS VARCHAR2(10)) AS PAYLOAD FROM DUAL",
             1,
@@ -124,6 +130,7 @@ async fn live_snapshot_bounds_are_all_or_nothing() -> Result<(), Box<dyn std::er
             let page = result?;
             assert_eq!(page.rows.len(), expected_rows);
             assert!(page.rows.iter().all(|row| row.cursor == Cursor::Snapshot));
+            assert_eq!(page.completion, QueryCompletion::Complete);
         } else {
             assert!(matches!(
                 result,
