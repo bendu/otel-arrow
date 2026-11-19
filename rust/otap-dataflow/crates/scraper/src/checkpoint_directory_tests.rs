@@ -115,7 +115,8 @@ fn managed_fixture() -> tempfile::TempDir {
         .prefix("otap-checkpoint-test-")
         .tempdir_in(otel_arrow_dfe_engine::testing::state_dir_test_parent())
         .expect("create state fixture beneath trusted test parent");
-    std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))
+        .expect("make state fixture private");
     directory
 }
 
@@ -215,6 +216,54 @@ fn checkpoint_directory_pins_engine_namespace_and_preserves_progress() {
         .write(before.revision, &Cursor::Scalar(ScalarValue::Int64(43)))
         .unwrap();
     assert_eq!(moved_store.read().unwrap(), Some(next));
+}
+
+/// Scenario: A managed binding owns its checkpoint before the root is renamed and a native alias is opened.
+/// Guarantees: The file lock excludes the alias, pinned progress survives, and reacquisition advances only successful generations.
+#[cfg(target_os = "linux")]
+#[test]
+fn checkpoint_directory_lease_survives_root_rename() {
+    let directory = managed_fixture();
+    let base = directory.path().canonicalize().unwrap();
+    let root = base.join("state");
+    let context = managed_context(&root);
+    let pinned = CheckpointStore::from_config(
+        "${engine.state_dir}/sql",
+        &context,
+        "receiver",
+        "source",
+        "fp".into(),
+    )
+    .unwrap();
+    let first = SourceLease::acquire(pinned.lease_key()).unwrap();
+    let generation = first.generation();
+    drop(first);
+    let binding = SourceBinding::acquire(pinned.clone()).unwrap();
+    let (before, _) = pinned
+        .write(0, &Cursor::Scalar(ScalarValue::Int64(42)))
+        .unwrap();
+    let moved = base.join("moved");
+    std::fs::rename(&root, &moved).unwrap();
+    let native = CheckpointStore::new(
+        &moved.join("sql"),
+        "group",
+        "pipeline",
+        "receiver",
+        "source",
+        "fp".into(),
+    );
+    assert!(matches!(
+        SourceLease::acquire(native.lease_key()),
+        Err(LeaseError::AlreadyOwned)
+    ));
+    assert_eq!(pinned.read().unwrap(), Some(before.clone()));
+    let (next, _) = pinned
+        .write(before.revision, &Cursor::Scalar(ScalarValue::Int64(43)))
+        .unwrap();
+    assert_eq!(native.read().unwrap(), Some(next));
+    drop(binding);
+    let reacquired = SourceLease::acquire(native.lease_key()).unwrap();
+    assert_eq!(reacquired.generation(), generation + 2);
 }
 
 /// Scenario: A configured suffix or identity namespace is a symlink outside the engine root.
