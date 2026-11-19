@@ -209,8 +209,10 @@ must not emit a partial snapshot. Deterministic complete-result row/byte overflo
 pauses the source until repaired and restarted.
 
 Checkpoint storage remains required for ownership and acknowledged revisions,
-but snapshot checkpoints do not retain a row offset. A retry or restart queries
-the current source again, not a saved copy of an earlier observation. Empty
+but snapshot checkpoints do not retain a row offset. Retryable NACKs replay the
+retained immutable encoded snapshot and candidate, not the current source.
+This buffer is not durable: restart and opt-in permanent-rejection retry query
+the current source again and may not reproduce changed or deleted rows. Empty
 results emit no logs. Transactions must finish before waiting for downstream ACK.
 
 ### Transport security
@@ -405,8 +407,18 @@ advances the acknowledged checkpoint.
 | Timeout or cancellation | Native operation exceeds the fixed 30-second deadline, pipeline stop interrupts a query | PostgreSQL cancellation is requested and the local connection task is stopped and joined. Retryable timeouts reconnect after backoff; possible old server work is fenced for the statement timeout. Unconfirmed cleanup fails closed. | Usually none for a recovered timeout. Perform a full process restart after terminal `Cleanup`. |
 | Query or metadata | Syntax error, missing table, permission denied, changed result columns/types, invalid cursor | The query is non-retryable and collection terminates without emitting or checkpointing the failed page. | Restore the expected query, result contract, and grants. For an intentional semantic change, review checkpoint compatibility rather than resetting progress. |
 | Conversion or bounds | Unsupported type/value, overflow, malformed timestamp or UTF-8, precision loss, non-advancing cursor, oversized frame/row/page | The entire page fails without skipping, truncating, coercing to text, or advancing the checkpoint. | Repair the source value/query or increase `max_batch_bytes`, then restart the receiver. |
-| Downstream delivery | Closed output channel, retryable NACK, permanent NACK/export rejection | A matching ACK and successful checkpoint write are both required to commit. Retryable NACK re-queries from the durable cursor after `nack_backoff`; permanent NACK pauses the source by default or uses explicitly configured capped retry. | Repair downstream delivery. Restart a source that remains paused under the default permanent-NACK policy. |
+| Downstream delivery | Closed output channel, retryable NACK, permanent NACK/export rejection | A matching ACK and successful checkpoint write are both required to commit. Retryable NACK replays retained immutable encoded bytes and candidate without querying or encoding again; permanent NACK pauses the source by default or explicitly retries by re-querying with capped backoff. | Repair downstream delivery. Restart a source that remains paused under the default permanent-NACK policy. |
 | Checkpoint or ownership | Corrupt/oversized state, checksum/version/source/fingerprint/revision mismatch, lease conflict, unavailable storage | Startup and reads fail closed. Write failures retry up to `max_consecutive_failures`, then terminate. The receiver never assumes a cursor position. | Repair or restore the exact checkpoint storage and ownership issue; do not delete or edit state without reviewing the replay position. |
+
+Each retryable-NACK replay send gets a fresh attempt ID; source-row edits do not
+change the retained page. Backoff doubles from `nack_backoff`, capped at the
+greater of `30s` and `nack_backoff`. Restart re-queries from committed progress
+because the replay buffer is not durable. Permanent rejection discards that
+buffer and retains committed progress and ownership: `pause` remains the default.
+Opt-in `retry` re-queries after 1, 2, 4, 8, 16, then 30 seconds, capped thereafter.
+Subsequent retryable NACKs stay on this permanent-rejection re-query schedule
+until a matching ACK is durably committed. Neither recovery path guarantees
+reproduction of source rows changed or deleted before re-query.
 
 ## Development
 

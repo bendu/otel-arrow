@@ -266,9 +266,9 @@ Snapshots are periodic complete observations, not incremental catch-up.
 | Field | Default | Description |
 | --- | --- | --- |
 | `checkpoint.directory` | **required** | Persistent, writable directory used for checkpoint storage and source ownership. Required in every mode, including snapshot. |
-| `checkpoint.on_nack` | **required** | Must be `rewind`: re-query from durable progress after retryable negative acknowledgement. |
+| `checkpoint.on_nack` | **required** | Must be `rewind`: keep committed progress unchanged and replay the retained immutable encoded page and candidate after retryable negative acknowledgement. |
 | `checkpoint.on_permanent_nack` | `pause` | `pause` stops this source until repaired and restarted; `retry` re-queries with capped backoff. |
-| `checkpoint.nack_backoff` | **required** | `1ms`-`5m`; delay before replaying a retryable NACK. The example uses `1s`. |
+| `checkpoint.nack_backoff` | **required** | `1ms`-`5m`; initial retryable-NACK delay, doubling per NACK up to the greater of this value and `30s`. The example uses `1s`. |
 | `checkpoint.max_consecutive_failures` | **required** | `1`-`1000`; consecutive durable checkpoint-write failures before termination. The example uses `5`. |
 
 Configuration preparation does not create directories, acquire leases, or
@@ -543,6 +543,17 @@ Progress advances only after downstream ACK and durable checkpoint
 installation. Crash recovery may replay rows already accepted downstream.
 There is **no exactly-once, deduplication, lookback, or automatic distributed
 partitioning guarantee**.
+
+Retryable NACKs replay the retained immutable encoded bytes and candidate without
+another query or encoding pass. Each send gets a fresh attempt ID; source-row
+edits do not change the retained page. Backoff doubles from `nack_backoff`, capped
+at the greater of `30s` and `nack_backoff`. The buffer is not durable: restart
+re-queries from committed progress. Permanent rejection discards the buffer and
+retains committed progress and ownership, pausing by default. Opt-in `retry`
+re-queries after 1, 2, 4, 8, 16, then 30 seconds, capped thereafter. Subsequent
+retryable NACKs stay on this permanent-rejection re-query schedule until a
+matching ACK is durably committed. Restart and permanent-rejection retry cannot
+guarantee reproduction of changed or deleted rows.
 
 Checkpoint ownership does not detect equivalent queries under different source
 identities or state directories. Do not bypass locks or reset progress to work

@@ -405,10 +405,13 @@ The affected source pauses without emitting or checkpointing a partial result;
 other pipeline sources continue. Split the query or increase the bound, then
 restart or reconfigure this source.
 
-NACK and restart re-run the full query against current data. No historical result
-is retained, so transient or deleted rows may not be replayable. Unchanged rows
-are intentionally emitted on every poll; snapshot mode offers neither CDC nor
-deduplication. The keyset source-ordering requirements below apply only to scalar
+Retryable NACKs replay the retained immutable encoded snapshot and candidate
+without re-querying or re-encoding; edits to source rows do not change that
+retained observation. This buffer is not durable: restart and opt-in
+permanent-rejection retry re-run the full query against current data, so changed
+or deleted rows may not be reproducible. Unchanged rows are intentionally emitted
+on every poll; snapshot mode offers neither CDC nor deduplication.
+The keyset source-ordering requirements below apply only to scalar
 and composite modes. Snapshot checkpoints still use source ownership, identity
 validation, and the configured permanent-NACK policy. Changing SQL, database,
 source identity, or mode requires a compatible checkpoint identity; it never
@@ -427,9 +430,9 @@ are required.
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
 | `checkpoint.directory` | string | **required** | Non-empty state directory without `..` components. Supports the `${engine.state_dir}` prefix; keep this directory persistent across restarts. |
-| `checkpoint.on_nack` | string | **required** | Only `rewind`: retain committed progress and re-query after a matching retryable NACK. |
+| `checkpoint.on_nack` | string | **required** | Only `rewind`: keep committed progress unchanged and replay the retained encoded page and candidate after a matching retryable NACK. |
 | `checkpoint.on_permanent_nack` | string | `pause` | Pause until repair and restart, or explicitly `retry` with shared capped backoff. Neither policy skips rows. |
-| `checkpoint.nack_backoff` | duration string | **required** | Between `1ms` and `5m`, inclusive. Fixed NACK replay delay; also used between checkpoint-write retries. |
+| `checkpoint.nack_backoff` | duration string | **required** | Between `1ms` and `5m`, inclusive. Initial retryable-NACK delay; doubles per NACK up to the greater of this value and `30s`. Also used between checkpoint-write retries. |
 | `checkpoint.max_consecutive_failures` | integer | **required** | Between `1` and `1000`. Consecutive checkpoint-write failures before termination; not a query-error or NACK retry limit. |
 
 See [Live configuration changes](#live-configuration-changes) for source
@@ -541,7 +544,7 @@ duplicates are possible; exactly-once delivery is not provided.
 | --- | --- |
 | Commit-visible cursor ordering | Once progress passes a cursor, no transaction may later expose a row at or before that cursor. Increasing IDs or append-only storage alone do not ensure this. |
 | Unique cursor | Rows must not share the same scalar key or timestamp/tie-breaker pair; otherwise a page boundary can exclude an unread row with an equal cursor. |
-| Stable cursor and selected values | A NACK executes the query again, rather than replaying an immutable saved payload. Updates can change both which rows qualify and what they contain. |
+| Stable cursor and selected values | Live retryable-NACK replay preserves the encoded page, but restart and opt-in permanent-rejection retry re-query. Updates can change both which rows qualify and what they contain on those paths. |
 | Sufficient retention | Keep rows available and unchanged throughout the maximum outage, downstream retry, and checkpoint-recovery window. Deletion or expiration before replay can lose the original data. |
 | Stable query semantics | The selected cursor must match the predicate/order values, and the query must continue to describe the same logical stream. |
 
@@ -550,10 +553,12 @@ Transaction B commits a row at 10:05, which is delivered and checkpointed.
 If A commits afterward, the next query starts after 10:05 and misses A.
 **Append-only data does not prevent this late-commit case.**
 
-Likewise, if a returned row is changed or deleted before a NACK retry, the
-original row cannot necessarily be reproduced. Backdated inserts, late commits
-behind the checkpoint, cursor reuse, mutable selected values, and insufficient
-retention are unsupported for the at-least-once guarantee.
+Likewise, if a returned row is changed or deleted before restart replay or opt-in
+permanent-rejection retry, the original row cannot necessarily be reproduced.
+Live retryable-NACK replay retains the original encoded bytes despite source
+edits; it does not make the buffer durable. Backdated inserts, late commits behind
+the checkpoint, cursor reuse, mutable selected values, and insufficient retention
+are unsupported for the at-least-once guarantee.
 
 ### Downstream Acknowledgement Boundary
 
@@ -572,8 +577,8 @@ formatting; it is not a durable production destination.
 | Condition | Receiver behavior |
 | --- | --- |
 | Matching ACK | Write the last emitted cursor to the checkpoint, then advance in-memory progress. |
-| Matching retryable NACK | Keep the committed cursor and re-query after `nack_backoff`. The returned page may differ if source rows changed. |
-| Matching permanent NACK | Pause this source by default, retaining ownership and committed progress; opt-in `retry` uses capped backoff. |
+| Matching retryable NACK | Keep committed progress unchanged and replay the retained immutable encoded bytes and candidate without querying or encoding again. Each send gets a fresh attempt ID; backoff doubles from `nack_backoff`, capped at the greater of `30s` and `nack_backoff`. Source edits do not change the retained page. |
+| Matching permanent NACK | Pause this source by default, retaining ownership and committed progress; opt-in `retry` discards the encoded page and re-queries with shared capped backoff. |
 | Stale or duplicate feedback | Do not advance progress. |
 | Empty query result | Wait for the next polling interval without advancing the cursor. |
 | Transient database availability failure | Discard failed session state and partial results; reconnect and revalidate through the shared polling runtime. |
@@ -598,8 +603,10 @@ cannot cancel a newer attempt.
 
 Permanent rejection with `pause` retains the checkpoint and lease without
 restarting the receiver; repair the destination and restart the source.
-With `retry`, shared capped backoff continues until a matching ACK is durably
-committed. The engine's separate runtime recovery policy can restart terminal
+With `retry`, re-query from committed progress after 1, 2, 4, 8, 16, then 30 seconds,
+capped at 30 seconds thereafter, until a matching ACK is durably committed.
+Subsequent retryable NACKs stay on this permanent-rejection re-query schedule
+until that commit. The engine's separate runtime recovery policy can restart terminal
 pipeline failures; disable it when testing source-local recovery in isolation.
 
 ## Live configuration changes
