@@ -111,9 +111,16 @@ impl LeasePaths {
         })?;
         create_dir_all_durable(parent)
             .map_err(|source| LeaseError::io("create parent directory for", parent, source))?;
-        let parent = std::fs::canonicalize(parent).map_err(|source| {
+        let canonical_parent = std::fs::canonicalize(parent).map_err(|source| {
             LeaseError::io("canonicalize parent directory for", parent, source)
         })?;
+        // A managed checkpoint store retains this descriptor for its entire
+        // lifetime. Do not turn that capability back into a pathname for I/O.
+        let parent = if cfg!(target_os = "linux") && parent.starts_with("/proc/self/fd") {
+            parent.to_owned()
+        } else {
+            canonical_parent.clone()
+        };
         let file_name = source.file_name().ok_or_else(|| LeaseError::InvalidPath {
             path: source.to_path_buf(),
         })?;
@@ -121,7 +128,7 @@ impl LeasePaths {
         // filename so different mounts of the same directory lock the same file.
         let digest = checkpoint_name_digest(file_name).to_hex();
         Ok(Self {
-            registry_key: parent.join(file_name),
+            registry_key: canonical_parent.join(file_name),
             lock: parent.join(format!(".otel-arrow-source-{digest}.lock")),
             generation_prefix: format!(".otel-arrow-source-{digest}.generation."),
             parent,

@@ -32,6 +32,11 @@ use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 
+#[path = "checkpoint_directory.rs"]
+mod directory;
+pub use directory::CheckpointDirectoryError;
+pub(crate) use directory::validate_directory;
+
 const ENVELOPE_VERSION: u8 = 1;
 const MAX_CHECKPOINT_BYTES: u64 = 16 * 1024;
 const MAX_HEX_ID_BYTES: usize = 64;
@@ -103,6 +108,9 @@ pub(crate) struct WriteControl {
 #[derive(Clone, Debug)]
 pub struct CheckpointStore {
     prefix: PathBuf,
+    // Managed stores and their blocking-worker clones retain the pinned parent.
+    // Arc shares an immutable descriptor, not mutable cross-core state.
+    _directory: Option<Arc<std::fs::File>>,
     source_id: String,
     config_fingerprint: String,
     // Clones move into successive blocking writers. Remember that mkdir
@@ -335,6 +343,9 @@ impl CheckpointError {
 
 impl CheckpointStore {
     /// Builds a store whose path encodes the exact pipeline and source IDs.
+    ///
+    /// `root` is a native path, not a configuration expression. Receivers must
+    /// use [`Self::from_config`] to resolve engine-owned checkpoint directories.
     #[must_use]
     pub fn new(
         root: &Path,
@@ -344,7 +355,7 @@ impl CheckpointStore {
         source_id: &str,
         config_fingerprint: String,
     ) -> Self {
-        let prefix = expand_state_dir(root)
+        let prefix = root
             .join("@v1")
             .join(encode_identity_segment(pipeline_group_id))
             .join(encode_identity_segment(pipeline_id))
@@ -352,6 +363,7 @@ impl CheckpointStore {
             .join(format!("{}.checkpoint", encode_identity_segment(source_id)));
         Self {
             prefix,
+            _directory: None,
             source_id: source_id.to_owned(),
             config_fingerprint,
             directory_ready: Arc::new(AtomicBool::new(false)),
@@ -870,16 +882,6 @@ fn parse_revision(prefix: &str, name: &str) -> Option<u64> {
         return None;
     }
     revision.parse().ok()
-}
-
-fn expand_state_dir(root: &Path) -> PathBuf {
-    if let Ok(rest) = root.strip_prefix(Path::new("${engine.state_dir}")) {
-        let base = std::env::var_os("OTAP_DF_STATE_DIR")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from(".otap-state"));
-        return base.join(rest);
-    }
-    root.to_path_buf()
 }
 
 #[cfg(unix)]

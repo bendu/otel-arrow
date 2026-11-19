@@ -1561,6 +1561,61 @@ mod factory {
         )
     }
 
+    /// Scenario: SQL Server selects the engine-root expression without a provisioned engine root.
+    /// Guarantees: The factory fails explicitly and malformed placeholders fail configuration validation.
+    #[test]
+    fn factory_checkpoint_directory_requires_engine_root() {
+        let mut raw = scalar(json!({"type":"int64","value":0}));
+        raw["checkpoint"]["directory"] = json!("${engine.state_dir}/sql");
+        let Err(error) = build(context(), raw.clone(), &TestRuntime::<OtapPdata>::new()) else {
+            panic!("missing engine root");
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("engine.state_dir is not configured")
+        );
+        raw["checkpoint"]["directory"] = json!("${UNKNOWN}/sql");
+        let error = (super::super::SQL_SERVER_RECEIVER.validate_config)(&raw).unwrap_err();
+        assert!(error.to_string().contains("placeholder"));
+    }
+
+    /// Scenario: SQL Server selects engine-owned storage containing acknowledged progress.
+    /// Guarantees: The factory retains the existing cursor and excludes native-path contenders.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn factory_checkpoint_directory_uses_engine_root() {
+        use otel_arrow_dfe_engine::state_dir::StateDirectory;
+        let directory = tempfile::tempdir_in(".").unwrap();
+        let root = directory.path().canonicalize().unwrap().join("state");
+        let context = ControllerContext::new(TelemetryRegistryHandle::new())
+            .with_state_directory(StateDirectory::provision(&root).unwrap())
+            .pipeline_context_with("group".into(), "pipeline".into(), 0, 1, 0);
+        let runtime = TestRuntime::<OtapPdata>::new();
+        let mut raw = scalar(json!({"type":"int64","value":0}));
+        raw["checkpoint"]["directory"] = json!("${engine.state_dir}/sql");
+        let config = parse(raw.clone());
+        let store = CheckpointStore::new(
+            &root.join("sql"),
+            "group",
+            "pipeline",
+            runtime.config().name.as_ref(),
+            config.source_id(),
+            config.config_fingerprint().to_owned(),
+        );
+        let (before, _) = store
+            .write(0, &config.query().watermark().initial())
+            .unwrap();
+        let receiver = build(context, raw, &runtime).unwrap();
+        assert!(matches!(
+            SourceLease::acquire(store.lease_key()),
+            Err(LeaseError::AlreadyOwned)
+        ));
+        assert_eq!(store.read().unwrap(), Some(before));
+        drop(receiver);
+        let _lease = SourceLease::acquire(store.lease_key()).unwrap();
+    }
+
     /// Scenario: The factory validates and builds against existing shared-format checkpoint progress.
     /// Guarantees: Validation is side-effect-free; construction leases the same source without resetting it.
     #[test]

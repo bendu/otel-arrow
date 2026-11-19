@@ -350,7 +350,7 @@ the polling controller manages when the store and lease are used.
 
 | Field | Type | Default | Validation / meaning |
 | --- | --- | --- | --- |
-| `directory` | string | **required** | Non-empty path without `..` path components, as interpreted by the host platform. |
+| `directory` | string | **required** | Explicit native path or `${engine.state_dir}` prefix, without `..`, NUL bytes, or unresolved placeholders. |
 | `on_nack` | string | **required** | Only `rewind` for retryable NACKs; permanent rejection uses the separate policy below. |
 | `on_permanent_nack` | string | `pause` | `pause` stops polling this source until repair and restart; opt-in `retry` uses capped backoff without advancing the checkpoint. |
 | `nack_backoff` | duration string | **required** | Between `1ms` and `5m`, inclusive. Fixed delay before replay. |
@@ -364,6 +364,38 @@ on_permanent_nack: pause
 nack_backoff: 1s
 max_consecutive_failures: 5
 ```
+
+#### Checkpoint directory selection
+
+Oracle, PostgreSQL, and SQL Server resolve `${engine.state_dir}` only through
+the engine's [provisioned state directory](../../docs/state-directory.md).
+Configure an explicit absolute `engine.state_dir` on Linux before using, for
+example, `directory: '${engine.state_dir}/postgresql'`. A missing engine root is
+a startup error, not an instruction to look up `OTAP_DF_STATE_DIR` or use
+`.otap-state`. Other unresolved `${...}` expressions are configuration errors.
+The normal configuration loader can expand explicit `${env:NAME}` expressions
+before receiver validation.
+
+Managed storage retains directory descriptors, refuses symlink descendants,
+and requires descendant directories owned by the collector UID without
+group/other write permission. It requires Linux procfs at `/proc/self/fd` for
+the shared checkpoint/lease filesystem operations. It never reopens the
+engine root by pathname or recreates it after removal.
+
+Explicit native paths keep their existing meaning on every supported receiver
+platform. Relative paths, including an explicit `.otap-state/postgresql`,
+remain relative to the process working directory; prefer an absolute persistent
+path if launch directories can change. Explicit paths are not rebased under
+`engine.state_dir`, even when the engine root is configured.
+
+Migration from the former implicit fallback: stop the receiver and identify its
+actual existing checkpoint directory. Set `checkpoint.directory` to that native
+path, or configure the exact existing parent as `engine.state_dir` if it meets
+the engine's trust requirements. Include the same suffix as before. Do not select
+a new root unless intentionally selecting different state. Existing checkpoint
+layout, source identity, fingerprints, and cursor values are unchanged; no
+automatic relocation, copying, or reset is performed. The console examples make
+the legacy environment/default selection explicit in their configuration.
 
 ### Output Configuration
 

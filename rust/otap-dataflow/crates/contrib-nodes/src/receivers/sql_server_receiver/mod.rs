@@ -47,7 +47,7 @@ use otel_arrow_dfe_scraper::{
 };
 use otel_arrow_dfe_telemetry::metrics::MetricSetRegistrar;
 use serde::Deserialize;
-use std::{path::Path, sync::Arc};
+use std::sync::Arc;
 
 /// Stable SQL Server receiver identifier.
 pub const SQL_SERVER_RECEIVER_URN: &str = "urn:otel:receiver:sql_server";
@@ -85,15 +85,15 @@ pub static SQL_SERVER_RECEIVER: ReceiverFactory<OtapPdata> = ReceiverFactory {
         }
         let query = config.query().clone();
         let checkpoint = config.checkpoint();
-        let source = SourceBinding::acquire(CheckpointStore::new(
-            Path::new(&checkpoint.directory),
-            pipeline.pipeline_group_id().as_ref(),
-            pipeline.pipeline_id().as_ref(),
+        let store = CheckpointStore::from_config(
+            &checkpoint.directory,
+            &pipeline,
             receiver_config.name.as_ref(),
             config.source_id(),
             config.config_fingerprint().to_owned(),
-        ))
-        .map_err(lease_error)?;
+        )
+        .map_err(invalid)?;
+        let source = SourceBinding::acquire(store).map_err(lease_error)?;
         let backoff = checkpoint.nack_backoff;
         let failures = checkpoint.max_consecutive_failures;
         let metrics = Some(pipeline.register_metric_set::<DatabaseReceiverMetrics>());

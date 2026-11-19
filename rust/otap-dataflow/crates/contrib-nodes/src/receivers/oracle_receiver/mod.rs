@@ -35,7 +35,6 @@ use otel_arrow_dfe_scraper::{
 use otel_arrow_dfe_telemetry::metrics::MetricSetRegistrar;
 use serde::Deserialize;
 use serde_json::Value;
-use std::path::Path;
 use std::sync::Arc;
 
 pub use adapter::{OracleAdapter, OracleAdapterError};
@@ -62,14 +61,14 @@ fn build(
     let config = parse(config)?;
     let query = config.query();
     let checkpoint = config.checkpoint();
-    let store = CheckpointStore::new(
-        Path::new(&checkpoint.directory),
-        pipeline.pipeline_group_id().as_ref(),
-        pipeline.pipeline_id().as_ref(),
+    let store = CheckpointStore::from_config(
+        &checkpoint.directory,
+        pipeline,
         receiver_name,
         config.source_id(),
         config.config_fingerprint().to_owned(),
-    );
+    )
+    .map_err(invalid_config)?;
     let source = SourceBinding::acquire(store).map_err(invalid_source_lease)?;
     let metrics = Some(pipeline.register_metric_set::<DatabaseReceiverMetrics>());
     Ok(DatabaseReceiver::new(

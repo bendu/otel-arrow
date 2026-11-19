@@ -61,6 +61,12 @@ fetch size and catch-up budgets have defaults. Unknown fields are rejected.
 
 This reference describes the YAML accepted by the OTEL-Arrow engine.
 
+See [checkpoint directory selection and migration](../../../../scraper/README.md#checkpoint-directory-selection)
+before adopting `${engine.state_dir}`. Explicit native paths retain their
+locations. The example below explicitly selects `OTAP_DF_STATE_DIR` or
+`.otap-state`; use an absolute persistent path to survive working-directory
+changes. On Windows, use an explicit native checkpoint path.
+
 Configure database connectivity, one query, its composite watermark, and
 checkpoint behavior in the receiver's `config` block. Configure credential
 acquisition through a pipeline extension and capability binding, and choose
@@ -426,7 +432,7 @@ are required.
 
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
-| `checkpoint.directory` | string | **required** | Non-empty state directory without `..` components. Supports the `${engine.state_dir}` prefix; keep this directory persistent across restarts. |
+| `checkpoint.directory` | string | **required** | Persistent native path without `..` components, or `${engine.state_dir}` prefix requiring an explicitly configured Linux engine root. No implicit environment/default fallback. |
 | `checkpoint.on_nack` | string | **required** | Only `rewind`: retain committed progress and re-query after a matching retryable NACK. |
 | `checkpoint.on_permanent_nack` | string | `pause` | Pause until repair and restart, or explicitly `retry` with shared capped backoff. Neither policy skips rows. |
 | `checkpoint.nack_backoff` | duration string | **required** | Between `1ms` and `5m`, inclusive. Fixed NACK replay delay; also used between checkpoint-write retries. |
@@ -744,7 +750,7 @@ groups:
                   bind: last_tie_breaker
                   initial: 0
               checkpoint:
-                directory: ${engine.state_dir}/oracle
+                directory: '${env:OTAP_DF_STATE_DIR:-.otap-state}/oracle'
                 on_nack: rewind
                 nack_backoff: 1s
                 max_consecutive_failures: 5

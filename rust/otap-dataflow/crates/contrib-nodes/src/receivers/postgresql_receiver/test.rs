@@ -913,6 +913,9 @@ use otel_arrow_dfe_engine::local::capability::auth::basic_auth_provider::BasicAu
 use serde_json::{Value, json};
 use tokio_postgres::types::Type;
 
+#[path = "checkpoint_config_tests.rs"]
+mod checkpoint_tests;
+
 struct TestCredentials;
 
 pub(super) fn fixed_credential() -> BasicAuthCredential {

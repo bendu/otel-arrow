@@ -87,7 +87,7 @@ Bind it through `basic_auth_provider`; receiver TLS and checkpoint behavior are 
 | `query.catch_up.max_pages` | No | `32`; `1`-`1024`, including empty probes. Composite/scalar only; snapshot never immediately repeats a successful observation for catch-up. |
 | `query.catch_up.max_duration` | No | `10s`; `1ms`-`5min`. Composite/scalar cycle budget; gates the next page, not an active page. |
 | `watermark` | Yes | Select `composite`, `scalar`, or `snapshot` using the mode-specific fields below. |
-| `checkpoint.directory` | Yes | Persistent writable state directory. |
+| `checkpoint.directory` | Yes | Persistent native path, or `${engine.state_dir}` prefix requiring a configured Linux engine root; no implicit fallback. |
 
 Checkpoint defaults: `on_nack: rewind`, `on_permanent_nack: pause`, `nack_backoff: 1s`, `max_consecutive_failures: 5`.
 
@@ -350,6 +350,13 @@ parameter matches a configured bind.
 
 Existing supported queries and [checkpoint identities](../../../../scraper/README.md#checkpoint-compatibility)
 remain compatible. No new fields, SQL rewrites, or checkpoint resets are needed.
+
+For checkpoint path compatibility, see
+[directory selection and migration](../../../../scraper/README.md#checkpoint-directory-selection).
+Explicit native paths are unchanged. `${engine.state_dir}` requires a configured
+Linux engine root and never falls back to `OTAP_DF_STATE_DIR` or `.otap-state`.
+The console example makes that legacy environment/default selection explicit;
+use an absolute persistent path if the working directory can change.
 
 Timestamp cursors require `timestamp`/`timestamptz`; composite additionally
 requires `timezone: UTC` in its timestamp block.

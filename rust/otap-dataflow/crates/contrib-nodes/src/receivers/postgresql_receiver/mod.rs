@@ -32,7 +32,7 @@ use otel_arrow_dfe_otap::{OTAP_RECEIVER_FACTORIES, pdata::OtapPdata};
 use otel_arrow_dfe_scraper::{
     CheckpointStore, DatabaseReceiver, DatabaseReceiverMetrics, LeaseError, SourceBinding,
 };
-use std::{path::Path, sync::Arc};
+use std::sync::Arc;
 
 otel_arrow_dfe_telemetry::otel_component_scope!(
     urn = POSTGRESQL_RECEIVER_URN,
@@ -108,14 +108,16 @@ fn create(
     let validated = config::PostgreSqlReceiverConfig::parse(&node_config.config)
         .and_then(config::PostgreSqlReceiverConfig::validate)
         .map_err(config_error)?;
-    let store = CheckpointStore::new(
-        Path::new(&validated.config.checkpoint.directory),
-        pipeline.pipeline_group_id().as_ref(),
-        pipeline.pipeline_id().as_ref(),
+    let store = CheckpointStore::from_config(
+        &validated.config.checkpoint.directory,
+        &pipeline,
         node.name.as_ref(),
         &validated.config.source_id,
         validated.fingerprint.clone(),
-    );
+    )
+    .map_err(|error| ConfigError::InvalidUserConfig {
+        error: error.to_string(),
+    })?;
     // Acquire exclusive ownership before driver work starts; the shared receiver
     // retains the binding through ACK/checkpoint handling and confirmed shutdown.
     let binding = SourceBinding::acquire(store).map_err(source_lease_error)?;

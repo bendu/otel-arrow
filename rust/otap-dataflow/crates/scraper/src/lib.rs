@@ -16,7 +16,9 @@ pub mod database;
 mod partition;
 mod telemetry;
 
-pub use checkpoint::{CheckpointError, CheckpointState, CheckpointStore, WriteOutcome};
+pub use checkpoint::{
+    CheckpointDirectoryError, CheckpointError, CheckpointState, CheckpointStore, WriteOutcome,
+};
 pub use controller::{DatabaseReceiver, SourceBinding};
 pub use partition::{LeaseError, SourceLease};
 pub use telemetry::DatabaseReceiverMetrics;

@@ -283,6 +283,7 @@ impl DriverAdapter for PostgreSqlAdapter {
         use otel_arrow_dfe_engine::error::ReceiverErrorKind;
         match error {
             Error::Config
+            | Error::CheckpointDirectory
             | Error::SourceQuery(_)
             | Error::Metadata
             | Error::SnapshotRowLimit { .. }
@@ -312,6 +313,10 @@ impl Drop for PostgreSqlAdapter {
 pub(crate) enum Error {
     #[error("postgresql: invalid configuration")]
     Config,
+    #[error(
+        "postgresql: checkpoint.directory must be a non-empty native path or an exact ${{engine.state_dir}} path prefix, without NUL bytes, '..' components, or unresolved placeholders"
+    )]
+    CheckpointDirectory,
     #[error(transparent)]
     SourceQuery(#[from] otel_arrow_dfe_scraper::database::SourceQueryError),
     #[error("postgresql: incompatible source metadata")]

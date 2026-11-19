@@ -106,8 +106,16 @@ recovery, and durability rules. They must not reopen the root by pathname or
 reprovision it when a live root disappears. No exclusive engine-root lock is
 held; multiple processes with the same service identity may share it.
 
+Oracle, PostgreSQL, and SQL Server use this capability when their
+`checkpoint.directory` starts with `${engine.state_dir}`. They reject a missing
+root and other unresolved placeholders without consulting `OTAP_DF_STATE_DIR`
+or falling back to `.otap-state`. Explicit native checkpoint paths are
+unchanged and are never rebased under the engine root. See the
+[SQL checkpoint directory migration guidance](../crates/scraper/README.md#checkpoint-directory-selection)
+before switching existing receivers to managed storage; configuring a different
+root does not relocate their checkpoints.
+
 This facility does not register Filelog or implement checkpoints. Journald still
 uses its existing `${engine.state_dir}` text expansion, `OTAP_DF_STATE_DIR` lookup,
-and `.otap-state` fallback. Database-scraper checkpoint storage with that legacy
-expansion also requires separate adoption work. Adding the engine setting does
-not migrate either consumer or relocate its checkpoints.
+and `.otap-state` fallback. Adding the engine setting does not migrate Journald
+or relocate its checkpoints.

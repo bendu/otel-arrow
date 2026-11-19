@@ -65,7 +65,7 @@ groups:
                   bind: last_tie_breaker
                   initial: 0
               checkpoint:
-                directory: '${engine.state_dir}/postgresql'
+                directory: '${env:OTAP_DF_STATE_DIR:-.otap-state}/postgresql'
                 on_nack: rewind
                 on_permanent_nack: pause
                 nack_backoff: 1s

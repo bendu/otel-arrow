@@ -1028,19 +1028,24 @@ fn non_utf8_state_roots_keep_lease_and_checkpoint_together() {
     drop(second_lease);
 }
 
-/// Scenario: An engine state-root placeholder has a non-UTF-8 trailing component on Unix.
-/// Guarantees: Placeholder expansion preserves that component's exact OS-native bytes.
+/// Scenario: An explicit native checkpoint path has a non-UTF-8 component on Unix.
+/// Guarantees: The store preserves its exact native bytes without text conversion or expansion.
 #[cfg(unix)]
 #[test]
-fn state_root_expansion_preserves_non_utf8_suffix() {
+fn native_checkpoint_root_preserves_non_utf8_component() {
     use std::os::unix::ffi::OsStringExt;
 
     let suffix = std::ffi::OsString::from_vec(vec![b'r', b'o', b'o', b't', b'-', 0xff]);
-    let root = Path::new("${engine.state_dir}").join(&suffix);
-    assert_eq!(
-        expand_state_dir(&root).file_name(),
-        Some(suffix.as_os_str())
+    let root = Path::new("state").join(&suffix);
+    let store = CheckpointStore::new(
+        &root,
+        "group",
+        "pipeline",
+        "receiver",
+        "source",
+        "fp".into(),
     );
+    assert!(store.lease_key().starts_with(&root));
 }
 
 /// Scenario: identity segments contain path separators or traversal components.

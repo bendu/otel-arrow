@@ -36,6 +36,11 @@ this receiver. Scheduling, backpressure, log encoding, downstream feedback,
 and checkpoint storage use the shared database scraper described in
 [RFC #3918][rfc].
 
+See [checkpoint directory selection and migration](../../../../scraper/README.md#checkpoint-directory-selection)
+before using `${engine.state_dir}`. Explicit native paths keep their locations;
+managed paths require an engine root and never use an environment or
+working-directory fallback. Prefer an absolute persistent native path on Windows.
+
 ## In This Guide
 
 - [Getting started](#getting-started): prerequisites, build, and run.
@@ -265,7 +270,7 @@ Snapshots are periodic complete observations, not incremental catch-up.
 
 | Field | Default | Description |
 | --- | --- | --- |
-| `checkpoint.directory` | **required** | Persistent, writable directory used for checkpoint storage and source ownership. Required in every mode, including snapshot. |
+| `checkpoint.directory` | **required** | Persistent native path or `${engine.state_dir}` prefix requiring a configured Linux engine root. No implicit fallback. Required in every mode, including snapshot. |
 | `checkpoint.on_nack` | **required** | Must be `rewind`: re-query from durable progress after retryable negative acknowledgement. |
 | `checkpoint.on_permanent_nack` | `pause` | `pause` stops this source until repaired and restarted; `retry` re-queries with capped backoff. |
 | `checkpoint.nack_backoff` | **required** | `1ms`-`5m`; delay before replaying a retryable NACK. The example uses `1s`. |

@@ -1460,6 +1460,58 @@ fn pipeline_context() -> PipelineContext {
     )
 }
 
+/// Scenario: Oracle's engine-root checkpoint expression has no engine capability or is malformed.
+/// Guarantees: Construction reports the missing root and validation rejects unresolved placeholders.
+#[test]
+fn factory_checkpoint_directory_requires_engine_root() {
+    let mut config = documented_config();
+    let error = build(&pipeline_context(), "oracle-audit", &config)
+        .err()
+        .expect("missing root");
+    assert!(
+        error
+            .to_string()
+            .contains("engine.state_dir is not configured")
+    );
+    config["checkpoint"]["directory"] = serde_json::json!("${UNKNOWN}/oracle");
+    let error = validate(&config).expect_err("unresolved placeholder");
+    assert!(error.to_string().contains("placeholder"));
+}
+
+/// Scenario: Oracle is constructed using an engine-owned root holding existing shared-format progress.
+/// Guarantees: The factory leases the original namespace without relocating or resetting its cursor.
+#[cfg(target_os = "linux")]
+#[test]
+fn factory_checkpoint_directory_uses_engine_root() {
+    use otel_arrow_dfe_engine::state_dir::StateDirectory;
+    let directory = tempfile::tempdir_in(".").unwrap();
+    let root = directory.path().canonicalize().unwrap().join("state");
+    let context = ControllerContext::new(TelemetryRegistryHandle::new())
+        .with_state_directory(StateDirectory::provision(&root).unwrap())
+        .pipeline_context_with("group".into(), "pipeline".into(), 0, 1, 0);
+    let raw = documented_config();
+    let config = parsed(raw.clone()).unwrap();
+    let store = CheckpointStore::new(
+        &root.join("oracle"),
+        "group",
+        "pipeline",
+        "oracle-audit",
+        config.source_id(),
+        config.config_fingerprint().to_owned(),
+    );
+    let (before, _) = store
+        .write(0, &config.query().watermark().initial())
+        .unwrap();
+    let receiver = build(&context, "oracle-audit", &raw).unwrap();
+    assert!(matches!(
+        SourceLease::acquire(store.lease_key()),
+        Err(LeaseError::AlreadyOwned)
+    ));
+    assert_eq!(store.read().unwrap(), Some(before));
+    drop(receiver);
+    let _lease = SourceLease::acquire(store.lease_key()).unwrap();
+}
+
 /// Scenario: The engine attempts to create the unpartitioned Oracle receiver on two cores.
 /// Guarantees: Factory validation rejects duplicate per-core pollers before acquiring a lease.
 #[test]

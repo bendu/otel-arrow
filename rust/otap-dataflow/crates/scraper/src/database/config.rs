@@ -331,17 +331,15 @@ impl WatermarkConfig {
 }
 
 impl CheckpointConfig {
+    /// Validates native paths and the exact engine-root configuration prefix.
+    pub fn validate_directory(&self) -> Result<(), crate::CheckpointDirectoryError> {
+        crate::checkpoint::validate_directory(&self.directory)
+    }
+
     /// Validates checkpoint location, backoff, and failure bounds.
     pub fn validate(&self) -> Result<(), ConfigError> {
-        validate_name("checkpoint.directory", &self.directory)?;
-        if std::path::Path::new(&self.directory)
-            .components()
-            .any(|component| matches!(component, std::path::Component::ParentDir))
-        {
-            return Err(ConfigError::new(
-                "checkpoint.directory must not contain '..' components",
-            ));
-        }
+        self.validate_directory()
+            .map_err(|error| ConfigError::new(error.to_string()))?;
         if self.nack_backoff < MIN_INTERVAL || self.nack_backoff > MAX_NACK_BACKOFF {
             return Err(ConfigError::new(format!(
                 "checkpoint.nack_backoff must be between 1ms and {}s",

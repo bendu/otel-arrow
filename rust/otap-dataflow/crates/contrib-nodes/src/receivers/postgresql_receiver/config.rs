@@ -289,6 +289,9 @@ impl PostgreSqlReceiverConfig {
             nack_backoff: self.checkpoint.nack_backoff,
             max_consecutive_failures: self.checkpoint.max_consecutive_failures,
         };
+        checkpoint
+            .validate_directory()
+            .map_err(|_| Error::CheckpointDirectory)?;
         // Shared compilation validates the configured page/fetch/byte bounds
         // and catch-up settings, using the same contract as the Oracle receiver.
         let common = CompiledQuery::compile(
