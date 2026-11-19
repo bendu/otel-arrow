@@ -140,7 +140,10 @@ impl fmt::Debug for TieBreakerCursorConfig {
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum OnNack {
-    /// Retain the durable cursor and re-query after a retryable NACK and backoff.
+    /// Keep committed progress unchanged and replay the retained immutable encoded
+    /// page and candidate after a retryable NACK and backoff, with a fresh attempt ID.
+    /// Restart re-queries; an already-active permanent-rejection retry continues
+    /// to follow [`OnPermanentNack`] instead.
     Rewind,
 }
 
@@ -166,7 +169,9 @@ pub struct CheckpointConfig {
     /// Permanent rejection policy; omitted configuration pauses only this source.
     #[serde(default)]
     pub on_permanent_nack: OnPermanentNack,
-    /// Fixed delay before replaying a negatively acknowledged page.
+    /// Initial delay before ordinary retryable-NACK replay; doubles on each retry,
+    /// capped at the greater of this delay and 30 seconds. Permanent-rejection
+    /// retries use their separate backoff policy.
     #[serde(with = "humantime_serde")]
     pub nack_backoff: Duration,
     /// Consecutive durable-write failures before the receiver terminates.

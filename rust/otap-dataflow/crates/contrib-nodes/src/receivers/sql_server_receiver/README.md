@@ -412,8 +412,11 @@ watermark:
 Each result must fit the row, normalized-memory, and encoded-OTLP limits
 **completely**. Overflow rejects the observation without emitting a truncated
 snapshot. Empty results emit no logs. Snapshot checkpoints retain ownership
-and acknowledged revisions, not a resumable row offset. A retry queries current
-data, not a stored copy of an earlier observation.
+and acknowledged revisions, not a resumable row offset. Live ordinary retryable
+NACKs replay the retained immutable encoded snapshot and candidate with fresh
+attempt IDs, without querying current data. Restart and opt-in
+permanent-rejection retry re-query instead; an already-active permanent-rejection
+retry keeps that policy even for subsequent retryable NACKs.
 
 ### Cursor Fields and Timestamp Precision
 

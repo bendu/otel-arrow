@@ -856,6 +856,8 @@ describe receiver activity, not database monitoring metrics.
 Metrics are counters except for the retained-bytes and rejection-pause gauges,
 with no custom measurement attributes.
 Common engine resource and node context may still accompany them.
+The retained-bytes gauge's exported instrument name is `retained.bytes`;
+`receiver.database` is its instrumentation scope, not part of that name.
 
 | Metric | Unit | Description |
 | --- | --- | --- |
@@ -866,7 +868,7 @@ Common engine resource and node context may still accompany them.
 | `receiver.database.batches_sent` | `{batch}` | Pages sent downstream. |
 | `receiver.database.rows_sent` | `{row}` | Rows sent downstream. |
 | `receiver.database.encoded_bytes_sent` | `By` | Encoded OTLP bytes sent downstream. |
-| `receiver.database.retained_bytes` | `By` | Gauge: encoded payload bytes retained for delivery, replay, and checkpoint completion; not a process-memory ceiling. |
+| `retained.bytes` | `By` | Gauge: encoded payload bytes retained for delivery, replay, and checkpoint completion; not a process-memory ceiling. |
 | `receiver.database.event_time_fallbacks` | `{record}` | Records using observation time because source time is outside OTLP's range. |
 | `receiver.database.acks` | `{ack}` | Matching downstream ACKs; not necessarily successful checkpoint commits. |
 | `receiver.database.nacks` | `{nack}` | Matching downstream NACKs. |
