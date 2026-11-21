@@ -677,6 +677,37 @@ jobs:
           retention-days: 30
           if-no-files-found: ignore
 
+  # Qualify local mount-alias exclusion separately from ordinary unprivileged tests.
+  sql_checkpoint_mounts:
+    needs: build_required_linux
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9
+        with:
+          toolchain: stable
+      - name: Install nextest
+        uses: taiki-e/install-action@1919c4a95903d2c33e4a221102edca87309fc14b # v2.89.0
+        with:
+          tool: cargo-nextest
+      - name: Download nextest archive
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: nextest-archive-ubuntu-latest
+          path: ./rust/otap-dataflow
+      - name: Qualify checkpoint ownership through two real bind mounts
+        working-directory: ./rust/otap-dataflow
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/sql-mount-tests"
+          bash ../../tools/test-sql-checkpoint-mounts.sh \
+            cargo nextest run --archive-file nextest-archive.tar.zst \
+            --extract-to "$GITHUB_WORKSPACE/sql-mount-tests" \
+            --run-ignored only --no-tests=fail --retries 0 \
+            -E 'package(=otel-arrow-dfe-scraper) & test(=checkpoint::tests::same_storage_mounted_at_different_paths_has_one_owner)'
+
   # Required Windows test partitions: run immediately after the Windows build.
   test_required_windows:
     needs: build_required_windows
@@ -1283,6 +1314,7 @@ jobs:
       - build_required_windows
       - test_required_linux
       - test_required_windows
+      - sql_checkpoint_mounts
       - crypto_provider_tests
       - fmt_required
       - clippy_required
@@ -1327,6 +1359,10 @@ jobs:
           fi
           if [[ "${{ needs.test_required_windows.result }}" != "success" ]]; then
             echo "test_required_windows failed or was cancelled"
+            exit 1
+          fi
+          if [[ "${{ needs.sql_checkpoint_mounts.result }}" != "success" ]]; then
+            echo "sql_checkpoint_mounts failed or was cancelled"
             exit 1
           fi
           if [[ "${{ needs.crypto_provider_tests.result }}" != "success" ]]; then

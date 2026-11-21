@@ -9,7 +9,9 @@ use std::time::{Duration, Instant};
 const PROCESS_ROOT: &str = "OTAP_SCRAPER_CHECKPOINT_TEST_ROOT";
 const PROCESS_MODE: &str = "OTAP_SCRAPER_CHECKPOINT_TEST_MODE";
 const PROCESS_TIMEOUT: Duration = Duration::from_secs(30);
+#[cfg(target_os = "linux")]
 const SHARED_STATE_ROOT: &str = "OTAP_SCRAPER_TEST_STATE_ROOT";
+#[cfg(target_os = "linux")]
 const SHARED_STATE_ALIAS: &str = "OTAP_SCRAPER_TEST_STATE_ALIAS";
 
 struct CheckpointProcess(Child);
@@ -1143,12 +1145,44 @@ fn process_restart_rejects_incompatible_and_corrupt_state() {
 
 /// Scenario: Two processes access one backing state directory through distinct container bind mounts.
 /// Guarantees: Their checkpoint lock, ownership generation, and orphan-cleanup namespace agree across mounts.
+#[cfg(target_os = "linux")]
 #[test]
+#[ignore = "requires two real Linux bind mounts; run tools/test-sql-checkpoint-mounts.sh"]
 fn same_storage_mounted_at_different_paths_has_one_owner() {
-    let Some(root) = std::env::var_os(SHARED_STATE_ROOT) else {
-        return;
-    };
+    use std::os::unix::fs::MetadataExt;
+
+    let root = PathBuf::from(
+        std::env::var_os(SHARED_STATE_ROOT).expect("OTAP_SCRAPER_TEST_STATE_ROOT is required"),
+    );
     let alias = PathBuf::from(std::env::var_os(SHARED_STATE_ALIAS).expect("second state mount"));
+    let root = root.canonicalize().expect("primary state mount");
+    let alias = alias.canonicalize().expect("alias state mount");
+    assert_ne!(root, alias, "symlinks are not distinct mounts");
+    let mount_id = |path: &Path| {
+        let output = Command::new("findmnt")
+            .args(["--noheadings", "--output", "ID", "--mountpoint"])
+            .arg(path)
+            .output()
+            .expect("findmnt is required for Linux mount qualification");
+        assert!(
+            output.status.success(),
+            "state path must be an actual mountpoint: {}",
+            path.display()
+        );
+        String::from_utf8(output.stdout)
+            .expect("mount ID")
+            .trim()
+            .parse::<u64>()
+            .expect("exactly one mount ID")
+    };
+    assert_ne!(mount_id(&root), mount_id(&alias), "distinct mount IDs");
+    let primary = std::fs::metadata(&root).expect("primary mount metadata");
+    let secondary = std::fs::metadata(&alias).expect("alias mount metadata");
+    assert_eq!(
+        (primary.dev(), primary.ino()),
+        (secondary.dev(), secondary.ino()),
+        "mounts must expose the same backing directory"
+    );
     let directory = tempfile::tempdir_in(root).expect("shared state directory");
     let alias = alias.join(directory.path().file_name().expect("state directory name"));
     std::fs::write(
@@ -1186,10 +1220,9 @@ fn same_storage_mounted_at_different_paths_has_one_owner() {
     );
     let next_owner = SourceLease::acquire(primary_store.lease_key()).expect("next primary owner");
     assert_eq!(next_owner.generation(), 3);
-    assert_eq!(
-        primary_store.read().expect("read").expect("state").revision,
-        2
-    );
+    let committed = primary_store.read().expect("read").expect("state");
+    assert_eq!(committed.revision, 2);
+    assert_eq!(committed.cursor, cursor("2026-01-01 00:00:01", 42));
 }
 
 /// Scenario: A parent test starts a fresh executable for a checkpoint lifecycle operation.

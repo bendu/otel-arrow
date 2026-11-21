@@ -40,6 +40,36 @@ Maintainers may apply `skipdeny` for pre-existing failures not introduced by the
 PR; record a reason and tracking issue. Relabeling reruns Repo Lint, not Rust CI.
 Other required checks remain enforced.
 
+## SQL checkpoint mount qualification
+
+The required `sql_checkpoint_mounts` Linux job reuses the required-build nextest
+archive and explicitly selects the ignored
+`checkpoint::tests::same_storage_mounted_at_different_paths_has_one_owner` test.
+Ordinary test runs report it as ignored, rather than silently passing without
+mount inputs.
+
+`tools/test-sql-checkpoint-mounts.sh` creates two real bind mounts of one fresh
+backing directory inside a private mount namespace. It checks distinct mount
+IDs and matching device/inode identity, prints mount evidence, and runs the
+supplied command as the invoking user. Linux util-linux tools and root or
+passwordless sudo for namespace/mount setup are required; missing prerequisites,
+failed setup, missing test selection, and invalid mount inputs fail qualification.
+Cleanup unmounts only the fixture's two mounts and removes only its temporary
+directory.
+
+For local qualification, build the scraper test first, then run its binary:
+
+```bash
+bash tools/test-sql-checkpoint-mounts.sh <scraper-test-binary> \
+  --exact checkpoint::tests::same_storage_mounted_at_different_paths_has_one_owner \
+  --ignored --nocapture
+```
+
+The test covers process-level exclusion, durable cursor resume, orphan cleanup,
+and ownership generations through local mount aliases. It does not qualify
+distributed or NFS fencing; symlinks and independent directories are not valid
+substitutes.
+
 ## Contrib integration tests
 
 Contrib components declare platform-specific integration tests in a
