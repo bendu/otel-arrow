@@ -55,14 +55,24 @@ supplied command as the invoking user. Linux util-linux tools and root or
 passwordless sudo for namespace/mount setup are required; missing prerequisites,
 failed setup, missing test selection, and invalid mount inputs fail qualification.
 Cleanup unmounts only the fixture's two mounts and removes only its temporary
-directory.
+directory. The helper propagates the supplied command's exit status; the test
+runner must enforce selection with `--no-tests=fail`.
+The local recipe assumes a standard HOME-based Rust installation; sudo does not
+preserve custom `CARGO_HOME` or `RUSTUP_HOME` settings.
 
-For local qualification, build the scraper test first, then run its binary:
+For local qualification, create a scraper-only nextest archive and run the
+same exact selection as CI:
 
 ```bash
-bash tools/test-sql-checkpoint-mounts.sh <scraper-test-binary> \
-  --exact checkpoint::tests::same_storage_mounted_at_different_paths_has_one_owner \
-  --ignored --nocapture
+cd rust/otap-dataflow
+cargo nextest archive --locked -p otel-arrow-dfe-scraper \
+  --archive-file scraper-tests.tar.zst
+mkdir -p target/sql-mount-tests
+bash ../../tools/test-sql-checkpoint-mounts.sh \
+  cargo nextest run --archive-file scraper-tests.tar.zst \
+  --extract-to "$PWD/target/sql-mount-tests" \
+  --run-ignored only --no-tests=fail --retries 0 \
+  -E 'package(=otel-arrow-dfe-scraper) & test(=checkpoint::tests::same_storage_mounted_at_different_paths_has_one_owner)'
 ```
 
 The test covers process-level exclusion, durable cursor resume, orphan cleanup,
