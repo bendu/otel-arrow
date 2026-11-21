@@ -256,25 +256,29 @@ impl DriverAdapter for FakeAdapter {
     }
 
     async fn shutdown(&mut self) -> Result<(), Self::Error> {
-        let key = self.lease_key.clone();
-        // Lease acquisition touches disk, even when used as a test assertion.
-        let worker = ScraperWorker::new().expect("lease probe worker");
-        let competing_lease = worker
-            .run(move || SourceLease::acquire(&key))
-            .expect("lease probe accepted")
-            .await
-            .expect("lease probe worker");
-        assert!(
-            competing_lease.is_err(),
-            "cleanup still owns the storage lease"
-        );
-        worker
-            .stop(Instant::now() + Duration::from_secs(1))
-            .await
-            .expect("lease probe stopped");
+        assert_cleanup_owns_lease(&self.lease_key, Instant::now).await;
         self.shutdown_joined.set(true);
         Ok(())
     }
+}
+
+async fn assert_cleanup_owns_lease(lease_key: &std::path::Path, now: fn() -> Instant) {
+    let key = lease_key.to_path_buf();
+    // Lease acquisition touches disk, even when used as a test assertion.
+    let worker = ScraperWorker::new().expect("lease probe worker");
+    let competing_lease = worker
+        .run(move || SourceLease::acquire(&key))
+        .expect("lease probe accepted")
+        .await
+        .expect("lease probe worker");
+    assert!(
+        competing_lease.is_err(),
+        "cleanup still owns the storage lease"
+    );
+    worker
+        .stop(now() + Duration::from_secs(1))
+        .await
+        .expect("lease probe stopped");
 }
 
 fn fake_query(checkpoint: &CheckpointConfig) -> CompiledQuery {

@@ -462,6 +462,56 @@ fn permanent_rejection_backoff_is_drainable() {
     run_rejection_retry(false);
 }
 
+struct PollClockBacklogAdapter(BacklogAdapter);
+
+#[async_trait(?Send)]
+impl DriverAdapter for PollClockBacklogAdapter {
+    type Error = TestCancellationError;
+    type Cancellation = TestCancellation;
+
+    fn system(&self) -> DatabaseSystem {
+        self.0.system()
+    }
+
+    fn begin_operation(&mut self) -> Result<Self::Cancellation, Self::Error> {
+        self.0.begin_operation()
+    }
+
+    fn is_retryable(error: &Self::Error) -> bool {
+        BacklogAdapter::is_retryable(error)
+    }
+
+    async fn reconnect(&mut self, query: &CompiledQuery) -> Result<(), Self::Error> {
+        self.0.reconnect(query).await
+    }
+
+    async fn validate_query(
+        &mut self,
+        query: &CompiledQuery,
+    ) -> Result<Vec<ColumnMetadata>, Self::Error> {
+        self.0.validate_query(query).await
+    }
+
+    async fn execute(
+        &mut self,
+        query: &CompiledQuery,
+        cursor: &Cursor,
+    ) -> Result<QueryPage, Self::Error> {
+        self.0.execute(query, cursor).await
+    }
+
+    async fn shutdown(&mut self) -> Result<(), Self::Error> {
+        // Resuming time retains the virtual offset. This test-only lease probe
+        // must set its timeout origin in the clock used by Tokio's timer.
+        assert_cleanup_owns_lease(&self.0.inner.lease_key, || {
+            tokio::time::Instant::now().into_std()
+        })
+        .await;
+        self.0.inner.shutdown_joined.set(true);
+        Ok(())
+    }
+}
+
 /// Scenario: The poll clock advances past the retry delay before a matching permanent NACK arrives.
 /// Guarantees: The receiver waits the full new rejection backoff before querying, keeps rejected progress uncommitted, and joins cleanup.
 #[test]
@@ -473,7 +523,7 @@ fn permanent_rejection_feedback_uses_current_poll_clock() {
     let fetched = Rc::new(RefCell::new(Vec::new()));
     let release_query = Rc::new(Cell::new(true));
     let receiver = DatabaseReceiver::new(
-        BacklogAdapter {
+        PollClockBacklogAdapter(BacklogAdapter {
             inner: FakeAdapter {
                 shutdown_joined: Rc::clone(&joined),
                 lease_key: store.lease_key().to_path_buf(),
@@ -482,7 +532,7 @@ fn permanent_rejection_feedback_uses_current_poll_clock() {
             delay: Duration::ZERO,
             max_id: 3,
             release_query: Some(Rc::clone(&release_query)),
-        },
+        }),
         fake_query(&config),
         SourceBinding::acquire(store.clone()).expect("source binding"),
         config.nack_backoff,
