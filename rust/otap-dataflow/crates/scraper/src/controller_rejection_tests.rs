@@ -461,3 +461,99 @@ fn permanent_rejection_retry_recovers_after_repair() {
 fn permanent_rejection_backoff_is_drainable() {
     run_rejection_retry(false);
 }
+
+/// Scenario: The poll clock advances past the retry delay before a matching permanent NACK arrives.
+/// Guarantees: The receiver waits the full new rejection backoff before querying, keeps rejected progress uncommitted, and joins cleanup.
+#[test]
+fn permanent_rejection_feedback_uses_current_poll_clock() {
+    let directory = tempfile::tempdir_in(".").expect("checkpoint directory");
+    let config = rejection_config(directory.path(), OnPermanentNack::Retry);
+    let store = source_store(directory.path(), "poll-clock");
+    let joined = Rc::new(Cell::new(false));
+    let fetched = Rc::new(RefCell::new(Vec::new()));
+    let release_query = Rc::new(Cell::new(true));
+    let receiver = DatabaseReceiver::new(
+        BacklogAdapter {
+            inner: FakeAdapter {
+                shutdown_joined: Rc::clone(&joined),
+                lease_key: store.lease_key().to_path_buf(),
+            },
+            fetched: Rc::clone(&fetched),
+            delay: Duration::ZERO,
+            max_id: 3,
+            release_query: Some(Rc::clone(&release_query)),
+        },
+        fake_query(&config),
+        SourceBinding::acquire(store.clone()).expect("source binding"),
+        config.nack_backoff,
+        config.max_consecutive_failures,
+        normal_admission(),
+        Some(DatabaseReceiverMetrics::register(
+            &create_test_pipeline_context(),
+        )),
+    );
+    let runtime = TestRuntime::<OtapPdata>::new();
+    let wrapper = ReceiverWrapper::local(
+        receiver,
+        test_node(runtime.config().name.clone()),
+        Arc::new(NodeUserConfig::new_receiver_config(
+            "urn:otel:receiver:rejection_clock_test",
+        )),
+        runtime.config(),
+    );
+    runtime
+        .set_receiver(wrapper)
+        .run_test(|_| async {})
+        .run_validation_concurrent(move |mut ctx| async move {
+            tokio::time::timeout(Duration::from_secs(30), async {
+                let first = ctx.recv().await.expect("first page");
+                assert_eq!(&*fetched.borrow(), &[0]);
+                // Keep any wrongly admitted query out of real encoding I/O while
+                // only the feedback/backoff phase uses the virtual clock.
+                release_query.set(false);
+                tokio::time::pause();
+                tokio::time::advance(RETRY_INITIAL + Duration::from_millis(100)).await;
+                let (_, nack) =
+                    next_nack(NackMsg::new_permanent("rejected", first)).expect("NACK route");
+                ctx.send_control_msg(NodeControlMsg::Nack(nack))
+                    .await
+                    .expect("permanent NACK");
+                let (reports, reporter) = MetricsReporter::create_new_and_receiver(1);
+                ctx.send_control_msg(NodeControlMsg::CollectTelemetry {
+                    metrics_reporter: reporter,
+                })
+                .await
+                .expect("NACK barrier");
+                let snapshot = reports.recv_async().await.expect("NACK processed");
+                assert_eq!(snapshot_counter(&snapshot, "nacks"), 1);
+                assert_eq!(&*fetched.borrow(), &[0], "no immediate re-query");
+                tokio::time::advance(RETRY_INITIAL - Duration::from_millis(1)).await;
+                let (reports, reporter) = MetricsReporter::create_new_and_receiver(1);
+                ctx.send_control_msg(NodeControlMsg::CollectTelemetry {
+                    metrics_reporter: reporter,
+                })
+                .await
+                .expect("pre-deadline barrier");
+                let _ = reports.recv_async().await.expect("receiver responsive");
+                assert_eq!(&*fetched.borrow(), &[0], "full delay after NACK");
+                tokio::time::advance(Duration::from_millis(1)).await;
+                tokio::time::resume();
+                release_query.set(true);
+                let retry = ctx.recv().await.expect("retry after backoff");
+                assert_page_id(&retry, 1);
+                assert_eq!(&*fetched.borrow(), &[0, 0], "same uncommitted cursor");
+                ctx.send_control_msg(NodeControlMsg::Shutdown {
+                    deadline: Instant::now() + Duration::from_secs(30),
+                    reason: "rejection clock verified".into(),
+                })
+                .await
+                .expect("shutdown");
+                assert!(ctx.recv().await.is_err());
+            })
+            .await
+            .expect("feedback path remains responsive");
+        });
+    assert!(joined.get());
+    assert!(store.read().expect("checkpoint").is_none());
+    drop(SourceBinding::acquire(store).expect("lease released after cleanup"));
+}

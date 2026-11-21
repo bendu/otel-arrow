@@ -765,7 +765,10 @@ where
                                 metrics.nacks.add(1);
                             }
                             if nack.permanent || state.rejection.is_some() {
-                                let delay = state.reject(query.on_permanent_nack(), Instant::now());
+                                let delay = state.reject(
+                                    query.on_permanent_nack(),
+                                    tokio::time::Instant::now().into_std(),
+                                );
                                 encoder.release_scratch();
                                 admission.interrupt_cycle();
                                 // Downstream reasons may contain customer data; report only fixed context.

@@ -3167,8 +3167,8 @@ async fn output_stall_preserves_rejection_and_database_backoff() {
 
     let start = tokio::time::Instant::now().into_std();
     let mut retry = DatabaseRetry::default();
-    for _ in 0..3 {
-        retry.schedule(start);
+    for seconds in [1, 2, 4] {
+        assert_eq!(retry.schedule(start), Duration::from_secs(seconds));
     }
     let (_sender, receiver) = Channel::new(1);
     let mut controls = local::ControlChannel::new(Receiver::Local(LocalReceiver::mpsc(receiver)));
