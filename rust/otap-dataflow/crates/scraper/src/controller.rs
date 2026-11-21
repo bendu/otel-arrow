@@ -118,6 +118,7 @@ fn worker_stop_deadline(deadline: Instant) -> Instant {
 struct PollAdmission {
     state: LocalReceiverAdmissionState,
     cycle_interrupted: Cell<bool>,
+    output_stalled: Cell<bool>,
 }
 
 impl PollAdmission {
@@ -426,6 +427,18 @@ impl ReceiverState {
         cycle.pages_started = cycle.pages_started.saturating_add(1);
     }
 
+    fn try_begin_poll(&mut self, interval: Duration, now: Instant, interrupted: bool) -> bool {
+        if !self.can_poll() && !self.can_replay() {
+            return false;
+        }
+        if self.cycle.is_some() && (interrupted || !self.can_continue_cycle(now)) {
+            self.finish_cycle(interval, now);
+            return false;
+        }
+        self.begin_poll(now);
+        true
+    }
+
     fn can_continue_cycle(&self, now: Instant) -> bool {
         // Re-executing a snapshot immediately would emit the same full result
         // repeatedly rather than make keyset progress. Always cool down.
@@ -443,11 +456,21 @@ impl ReceiverState {
         self.schedule_after(interval, now);
     }
 
-    fn schedule_after_commit(&mut self, interval: Duration, now: Instant, interrupted: bool) {
-        if !interrupted && self.can_continue_cycle(now) {
-            self.next_poll = now;
-        } else {
+    fn schedule_after_commit(
+        &mut self,
+        interval: Duration,
+        now: Instant,
+        interrupted: bool,
+        output_stalled: bool,
+    ) {
+        if interrupted || !self.can_continue_cycle(now) {
             self.finish_cycle(interval, now);
+        } else if output_stalled {
+            // Reuse the initial recovery delay, but retain the cycle's original
+            // budgets. Admission rechecks elapsed time when this timer expires.
+            self.schedule_after(interval.min(RETRY_INITIAL), now);
+        } else {
+            self.next_poll = now;
         }
     }
 
@@ -556,6 +579,7 @@ where
         let admission = PollAdmission {
             state: admission,
             cycle_interrupted: Cell::new(false),
+            output_stalled: Cell::new(false),
         };
         let stopping = StopState::default();
         let mut worker = None;
@@ -580,12 +604,14 @@ where
             OperationOutcome::Completed(result) => result?,
             OperationOutcome::Stopped(stop) => return Ok(stopped_state(stop, &metrics)),
         };
+        // Poll timers and cycle budgets share Tokio's monotonic clock. Native
+        // worker and stop deadlines keep their existing host-clock semantics.
         let mut state = ReceiverState::new(
             loaded.unwrap_or_else(|| CheckpointState {
                 revision: 0,
                 cursor: query.watermark().initial(),
             }),
-            Instant::now(),
+            tokio::time::Instant::now().into_std(),
             query.catch_up(),
         );
         query.watermark().validate_cursor(&state.committed).map_err(|error| {
@@ -647,7 +673,7 @@ where
             // I/O helpers may have consumed pressure updates, including on an
             // empty query. Reconcile pressure whenever encoder ownership is local.
             let pressure_paused = pause_for_pressure(
-                &admission, &mut state, &mut encoder, query.interval(), Instant::now(),
+                &admission, &mut state, &mut encoder, query.interval(), tokio::time::Instant::now().into_std(),
             );
             let can_poll = (state.can_poll() || state.can_replay()) && !pressure_paused;
             tokio::select! {
@@ -716,8 +742,9 @@ where
                             }
                             state.schedule_after_commit(
                                 query.interval(),
-                                Instant::now(),
+                                tokio::time::Instant::now().into_std(),
                                 admission.cycle_interrupted.get(),
+                                admission.output_stalled.replace(false),
                             );
                             if let Some(stop) = stopping.request.get() {
                                 return Ok(stopped_state(stop, &metrics));
@@ -811,19 +838,16 @@ where
                 }
 
                 () = poll_due(state.next_poll, can_poll), if can_poll => {
-                    let now = Instant::now();
-                    // A ready timer does not authorize another page after the
-                    // active cycle's budget or an intervening pressure event.
-                    if state.cycle.is_some()
-                        && (admission.cycle_interrupted.get() || !state.can_continue_cycle(now))
-                    {
-                        state.finish_cycle(query.interval(), now);
-                        continue;
-                    }
+                    let now = tokio::time::Instant::now().into_std();
                     if state.cycle.is_none() {
                         admission.cycle_interrupted.set(false);
+                        admission.output_stalled.set(false);
                     }
-                    state.begin_poll(now);
+                    // A ready timer does not authorize another page after the
+                    // active cycle's budget or an intervening pressure event.
+                    if !state.try_begin_poll(query.interval(), now, admission.cycle_interrupted.get()) {
+                        continue;
+                    }
                     if state.retained.is_none() {
                         let cursor = state.committed.clone();
                         let page = loop {
@@ -928,7 +952,7 @@ where
                         let encoded = match encoded {
                             Ok(Some(encoded)) => encoded,
                             Ok(None) => {
-                                state.finish_cycle(query.interval(), Instant::now());
+                                state.finish_cycle(query.interval(), tokio::time::Instant::now().into_std());
                                 continue;
                             }
                             Err(error) => {
@@ -1632,7 +1656,7 @@ async fn send_or_stop(
     let pdata = match effect_handler.try_send_message(pdata) {
         Ok(()) => return Ok(SendOutcome::Sent),
         Err(TypedError::ChannelSendError(SendError::Full(pdata))) => {
-            admission.interrupt_cycle();
+            admission.output_stalled.set(true);
             pdata
         }
         Err(error) => return Err(error.into()),

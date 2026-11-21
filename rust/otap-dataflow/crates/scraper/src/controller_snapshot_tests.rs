@@ -14,25 +14,27 @@ fn snapshot_state(now: Instant) -> ReceiverState {
     )
 }
 
-/// Scenario: A snapshot is acknowledged while there is still ample catch-up budget.
+/// Scenario: A snapshot is acknowledged with ample catch-up budget, with or without an output stall.
 /// Guarantees: A full polling interval follows commit instead of immediately repeating the full query.
 #[test]
 fn snapshot_commit_always_ends_the_cycle() {
     let now = Instant::now();
     let interval = Duration::from_secs(60);
-    let mut state = snapshot_state(now);
-    state.begin_poll(now);
-    assert!(!state.can_continue_cycle(now));
-    state.record_sent(Cursor::Snapshot);
-    assert!(!state.can_poll());
-    state.commit(CheckpointState {
-        revision: 1,
-        cursor: Cursor::Snapshot,
-    });
-    state.schedule_after_commit(interval, now, false);
-    assert_eq!(state.next_poll, now + interval);
-    assert!(state.cycle.is_none());
-    assert!(state.can_poll());
+    for output_stalled in [false, true] {
+        let mut state = snapshot_state(now);
+        state.begin_poll(now);
+        assert!(!state.can_continue_cycle(now));
+        state.record_sent(Cursor::Snapshot);
+        assert!(!state.can_poll());
+        state.commit(CheckpointState {
+            revision: 1,
+            cursor: Cursor::Snapshot,
+        });
+        state.schedule_after_commit(interval, now, false, output_stalled);
+        assert_eq!(state.next_poll, now + interval);
+        assert!(state.cycle.is_none());
+        assert!(state.can_poll());
+    }
 }
 
 /// Scenario: A snapshot receives stale feedback, a retryable NACK, then a permanent rejection.

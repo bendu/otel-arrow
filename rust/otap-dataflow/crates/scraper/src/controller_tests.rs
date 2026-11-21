@@ -138,6 +138,7 @@ fn poll_admission() -> PollAdmission {
     PollAdmission {
         state: normal_admission(),
         cycle_interrupted: Cell::new(false),
+        output_stalled: Cell::new(false),
     }
 }
 
@@ -2874,7 +2875,7 @@ fn catch_up_page_budget_is_ack_gated_and_exact() {
                 "matching ACK still needs a durable write"
             );
             state.commit(checkpoint(page as u64, page as i64));
-            state.schedule_after_commit(interval, now, false);
+            state.schedule_after_commit(interval, now, false, false);
             assert_eq!(
                 state.next_poll,
                 if page < max_pages {
@@ -2909,7 +2910,7 @@ fn catch_up_elapsed_budget_includes_ack_wait() {
         assert!(!state.can_poll());
         assert_eq!(state.can_continue_cycle(now + elapsed), elapsed < budget);
         state.commit(checkpoint(1, 1));
-        state.schedule_after_commit(interval, now + elapsed, false);
+        state.schedule_after_commit(interval, now + elapsed, false, false);
         assert_eq!(
             state.next_poll,
             now + elapsed
@@ -2930,7 +2931,7 @@ fn catch_up_elapsed_budget_includes_ack_wait() {
     }
 }
 
-/// Scenario: An empty page, interrupted send/commit, or NACK terminates a partly used catch-up cycle.
+/// Scenario: An empty page, hard interruption, or NACK terminates a partly used catch-up cycle.
 /// Guarantees: Normal delay or NACK backoff replaces immediate continuation and the next cycle gets a fresh budget.
 #[test]
 fn catch_up_empty_interruption_and_nack_reset_cycle() {
@@ -2956,7 +2957,7 @@ fn catch_up_empty_interruption_and_nack_reset_cycle() {
             "interrupted" => {
                 state.record_sent(checkpoint(0, 1).cursor);
                 state.commit(checkpoint(1, 1));
-                state.schedule_after_commit(interval, now, true);
+                state.schedule_after_commit(interval, now, true, false);
             }
             _ => {
                 state.record_sent(checkpoint(0, 1).cursor);
@@ -2981,26 +2982,213 @@ fn catch_up_empty_interruption_and_nack_reset_cycle() {
     }
 }
 
-/// Scenario: A single-page cycle receives its ACK after a long downstream wait.
+/// Scenario: A single-page cycle receives its ACK after a long wait, with or without an output stall.
 /// Guarantees: The next cycle's interval starts after the durable commit, not after page send.
 #[test]
 fn single_page_cycle_waits_interval_after_commit() {
     let now = Instant::now();
     let interval = Duration::from_secs(60);
+    for output_stalled in [false, true] {
+        let mut state = ReceiverState::new(
+            checkpoint(0, 0),
+            now,
+            CatchUpConfig {
+                max_pages: 1,
+                ..CatchUpConfig::default()
+            },
+        );
+        state.begin_poll(now);
+        state.record_sent(checkpoint(0, 1).cursor);
+        state.commit(checkpoint(1, 1));
+        state.schedule_after_commit(interval, now + interval * 2, false, output_stalled);
+        assert_eq!(state.next_poll, now + interval * 3);
+        assert!(state.cycle.is_none());
+    }
+}
+
+/// Scenario: A brief output stall resolves within a five-minute polling interval.
+/// Guarantees: Send and ACK alone cannot admit a query; durable completion resumes after one second with the original page budget.
+#[tokio::test(start_paused = true)]
+async fn output_stall_recovers_after_commit_without_resetting_cycle() {
+    let start = tokio::time::Instant::now().into_std();
+    let interval = Duration::from_secs(300);
     let mut state = ReceiverState::new(
         checkpoint(0, 0),
-        now,
+        start,
         CatchUpConfig {
-            max_pages: 1,
-            ..CatchUpConfig::default()
+            max_pages: 2,
+            max_duration: Duration::from_secs(10),
         },
     );
-    state.begin_poll(now);
+    assert!(state.try_begin_poll(interval, start, false));
     state.record_sent(checkpoint(0, 1).cursor);
+    tokio::time::advance(Duration::from_millis(100)).await;
+    let committed_at = tokio::time::Instant::now().into_std();
+    assert!(
+        !state.try_begin_poll(interval, committed_at, false),
+        "pending send/ACK"
+    );
+    assert!(state.ack_candidate(1).is_some());
+    assert!(
+        !state.try_begin_poll(interval, committed_at, false),
+        "pending checkpoint"
+    );
+    assert_eq!(state.revision, 0);
     state.commit(checkpoint(1, 1));
-    state.schedule_after_commit(interval, now + interval * 2, false);
-    assert_eq!(state.next_poll, now + interval * 3);
+    state.schedule_after_commit(interval, committed_at, false, true);
+    poll_due(state.next_poll, state.can_poll()).await;
+    let resumed_at = tokio::time::Instant::now().into_std();
+    assert_eq!(resumed_at.duration_since(committed_at), RETRY_INITIAL);
+    assert!(state.try_begin_poll(interval, resumed_at, false));
+    let cycle = state.cycle.as_ref().expect("same cycle");
+    assert_eq!(cycle.started, start);
+    assert_eq!(cycle.pages_started, 2);
+    state.record_sent(checkpoint(0, 2).cursor);
+    state.commit(checkpoint(2, 2));
+    state.schedule_after_commit(interval, resumed_at, false, true);
+    assert_eq!(state.next_poll, resumed_at + interval, "page budget wins");
     assert!(state.cycle.is_none());
+}
+
+/// Scenario: The elapsed cycle budget expires exactly during a temporary output cooldown.
+/// Guarantees: Timer readiness does not admit a query or reset budgets; expiration starts the full interval.
+#[tokio::test(start_paused = true)]
+async fn output_stall_cooldown_rechecks_elapsed_budget() {
+    let start = tokio::time::Instant::now().into_std();
+    let interval = Duration::from_secs(300);
+    let mut state = ReceiverState::new(
+        checkpoint(0, 0),
+        start,
+        CatchUpConfig {
+            max_pages: 32,
+            max_duration: Duration::from_millis(1500),
+        },
+    );
+    assert!(state.try_begin_poll(interval, start, false));
+    state.record_sent(checkpoint(0, 1).cursor);
+    tokio::time::advance(Duration::from_millis(500)).await;
+    let committed_at = tokio::time::Instant::now().into_std();
+    state.commit(checkpoint(1, 1));
+    state.schedule_after_commit(interval, committed_at, false, true);
+    assert!(state.can_continue_cycle(committed_at));
+    poll_due(state.next_poll, state.can_poll()).await;
+    let expired_at = tokio::time::Instant::now().into_std();
+    assert_eq!(expired_at, start + Duration::from_millis(1500));
+    assert!(!state.try_begin_poll(interval, expired_at, false));
+    assert!(state.cycle.is_none());
+    assert_eq!(state.revision, 1);
+    assert_eq!(state.next_poll, expired_at + interval);
+}
+
+/// Scenario: Sustained send or ACK waits exhaust a cycle, or hard pressure/checkpoint/database failure interrupts a stalled cycle.
+/// Guarantees: Non-capacity interruptions and exhausted durations take precedence over the short output cooldown.
+#[tokio::test(start_paused = true)]
+async fn output_stall_does_not_shorten_interrupted_or_exhausted_cycles() {
+    let interval = Duration::from_secs(300);
+    for (wait, interrupted) in [
+        (Duration::from_secs(10), false),
+        (Duration::from_millis(100), true),
+    ] {
+        let start = tokio::time::Instant::now().into_std();
+        let mut state = ReceiverState::new(checkpoint(0, 0), start, CatchUpConfig::default());
+        state.begin_poll(start);
+        state.record_sent(checkpoint(0, 1).cursor);
+        tokio::time::advance(wait).await;
+        let completed_at = tokio::time::Instant::now().into_std();
+        assert!(!state.can_poll(), "sustained pending work cannot fetch");
+        state.commit(checkpoint(1, 1));
+        state.schedule_after_commit(interval, completed_at, interrupted, true);
+        assert_eq!(state.next_poll, completed_at + interval);
+        assert!(state.cycle.is_none());
+    }
+}
+
+/// Scenario: Short polling intervals and drain/pause gates coincide with output recovery.
+/// Guarantees: Cooldown never exceeds the configured interval and cannot admit work after drain or source pause.
+#[tokio::test(start_paused = true)]
+async fn output_stall_cooldown_is_interval_capped_and_stop_gated() {
+    let interval = Duration::from_millis(20);
+    for pause in [false, true] {
+        let start = tokio::time::Instant::now().into_std();
+        let mut state = ReceiverState::new(checkpoint(0, 0), start, CatchUpConfig::default());
+        state.begin_poll(start);
+        state.record_sent(checkpoint(0, 1).cursor);
+        state.commit(checkpoint(1, 1));
+        state.schedule_after_commit(interval, start, false, true);
+        poll_due(state.next_poll, state.can_poll()).await;
+        let due = tokio::time::Instant::now().into_std();
+        assert_eq!(due, start + interval);
+        if pause {
+            state.pause_source();
+        } else {
+            state.begin_drain();
+        }
+        assert!(!state.try_begin_poll(interval, due, false));
+        assert_eq!(state.revision, 1);
+    }
+}
+
+/// Scenario: Retryable or permanent feedback rejects a stalled page, or database recovery is already backing off.
+/// Guarantees: Output-capacity recovery cannot shorten rejection/replay/database delays, reopen a permanent pause, or commit rejected progress.
+#[tokio::test(start_paused = true)]
+async fn output_stall_preserves_rejection_and_database_backoff() {
+    let admission = poll_admission();
+    admission.output_stalled.set(true);
+    for policy in [
+        None,
+        Some(OnPermanentNack::Retry),
+        Some(OnPermanentNack::Pause),
+    ] {
+        let start = tokio::time::Instant::now().into_std();
+        let mut state = ReceiverState::new(checkpoint(0, 0), start, CatchUpConfig::default());
+        state.begin_poll(start);
+        state.record_sent(checkpoint(0, 1).cursor);
+        let delay = match policy {
+            None => {
+                let delay = state.next_replay_delay(Duration::from_secs(5));
+                assert!(state.nack(1, start + delay));
+                Some(delay)
+            }
+            Some(policy) => state.reject(policy, start),
+        };
+        assert_eq!(state.revision, 0);
+        assert_eq!(state.committed, checkpoint(0, 0).cursor);
+        assert!(state.cycle.is_none());
+        if let Some(delay) = delay {
+            poll_due(state.next_poll, state.can_attempt()).await;
+            assert_eq!(tokio::time::Instant::now().into_std(), start + delay);
+        } else {
+            assert!(
+                !state.can_attempt(),
+                "permanent pause cannot recover on capacity"
+            );
+        }
+    }
+
+    let start = tokio::time::Instant::now().into_std();
+    let mut retry = DatabaseRetry::default();
+    for _ in 0..3 {
+        retry.schedule(start);
+    }
+    let (_sender, receiver) = Channel::new(1);
+    let mut controls = local::ControlChannel::new(Receiver::Local(LocalReceiver::mpsc(receiver)));
+    assert!(
+        wait_database_retry(
+            retry.retry_at.expect("database retry"),
+            &mut controls,
+            &mut None,
+            &admission,
+            &StopState::default(),
+        )
+        .await
+        .expect("database recovery wait")
+        .is_none()
+    );
+    assert_eq!(
+        tokio::time::Instant::now().into_std(),
+        start + Duration::from_secs(4)
+    );
+    assert_eq!(retry.failures, 3);
 }
 
 /// Scenario: Hard pressure arrives during the idle interval and clears at its deadline.
@@ -3601,6 +3789,7 @@ fn catch_up_loop_enforces_budgets_feedback_and_memory_admission() {
 struct BlockedSendProbe {
     admission: Rc<PollAdmission>,
     started: Rc<Cell<bool>>,
+    hard_pressure: bool,
 }
 
 #[async_trait(?Send)]
@@ -3640,12 +3829,42 @@ impl local::Receiver<OtapPdata> for BlockedSendProbe {
         )
         .await?;
         assert!(matches!(outcome, SendOutcome::Sent));
-        assert!(self.admission.cycle_interrupted.get());
+        assert!(self.admission.output_stalled.get());
+        assert_eq!(self.admission.cycle_interrupted.get(), self.hard_pressure);
         assert!(!self.admission.state.should_shed_ingress());
         state.commit(checkpoint(1, 1));
-        state.schedule_after_commit(interval, now, self.admission.cycle_interrupted.get());
-        assert_eq!(state.next_poll, now + interval);
-        assert!(state.cycle.is_none());
+        state.schedule_after_commit(
+            interval,
+            now,
+            self.admission.cycle_interrupted.get(),
+            self.admission.output_stalled.replace(false),
+        );
+        assert!(!self.admission.output_stalled.get(), "stall consumed once");
+        assert_eq!(
+            state.next_poll,
+            now + if self.hard_pressure {
+                interval
+            } else {
+                RETRY_INITIAL
+            },
+        );
+        assert_eq!(state.cycle.is_none(), self.hard_pressure);
+        if !self.hard_pressure {
+            let resumed_at = now + RETRY_INITIAL;
+            assert!(state.try_begin_poll(interval, resumed_at, false));
+            state.record_sent(checkpoint(0, 2).cursor);
+            state.commit(checkpoint(2, 2));
+            state.schedule_after_commit(
+                interval,
+                resumed_at,
+                false,
+                self.admission.output_stalled.replace(false),
+            );
+            assert_eq!(
+                state.next_poll, resumed_at,
+                "old stall cannot delay the next page"
+            );
+        }
         Ok(TerminalState::default())
     }
 }
@@ -3654,6 +3873,17 @@ impl local::Receiver<OtapPdata> for BlockedSendProbe {
 /// Guarantees: The send finishes without dropping pdata, applies both controls, and backpressure ends immediate catch-up.
 #[test]
 fn blocked_send_applies_pressure_and_ends_catch_up() {
+    run_blocked_send_probe(true);
+}
+
+/// Scenario: A capacity-one output queue fills briefly without memory pressure.
+/// Guarantees: Only actual queue saturation marks a stall; successful delivery retains the cycle and consumes the cooldown marker once.
+#[test]
+fn blocked_send_marks_temporary_output_stall_without_interrupting_cycle() {
+    run_blocked_send_probe(false);
+}
+
+fn run_blocked_send_probe(hard_pressure: bool) {
     let admission = Rc::new(poll_admission());
     let started = Rc::new(Cell::new(false));
     let runtime = TestRuntime::<OtapPdata>::new();
@@ -3663,6 +3893,7 @@ fn blocked_send_applies_pressure_and_ends_catch_up() {
         BlockedSendProbe {
             admission: Rc::clone(&admission),
             started: Rc::clone(&started),
+            hard_pressure,
         },
         test_node(config.name.clone()),
         Arc::new(NodeUserConfig::new_receiver_config(
@@ -3675,20 +3906,22 @@ fn blocked_send_applies_pressure_and_ends_catch_up() {
         .run_test(|_| async {})
         .run_validation_concurrent(move |mut ctx| async move {
             tokio::time::timeout(Duration::from_secs(2), async {
-                while !started.get() || !admission.cycle_interrupted.get() {
+                while !started.get() || !admission.output_stalled.get() {
                     tokio::task::yield_now().await;
                 }
-                ctx.send_control_msg(pressure(2, MemoryPressureLevel::Hard))
-                    .await
-                    .expect("hard");
-                while !admission.state.should_shed_ingress() {
-                    tokio::task::yield_now().await;
-                }
-                ctx.send_control_msg(pressure(3, MemoryPressureLevel::Normal))
-                    .await
-                    .expect("normal");
-                while admission.state.should_shed_ingress() {
-                    tokio::task::yield_now().await;
+                if hard_pressure {
+                    ctx.send_control_msg(pressure(2, MemoryPressureLevel::Hard))
+                        .await
+                        .expect("hard");
+                    while !admission.state.should_shed_ingress() {
+                        tokio::task::yield_now().await;
+                    }
+                    ctx.send_control_msg(pressure(3, MemoryPressureLevel::Normal))
+                        .await
+                        .expect("normal");
+                    while admission.state.should_shed_ingress() {
+                        tokio::task::yield_now().await;
+                    }
                 }
                 let _ = ctx.recv().await.expect("queued page");
                 let _ = ctx.recv().await.expect("blocked page is retained");

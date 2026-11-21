@@ -828,8 +828,17 @@ catch-up and use the local database recovery policy above. A checkpoint write fa
 catch-up, but the existing checkpoint retry policy must first finish committing
 the ACKed page (or reach its terminal failure limit).
 
-Downstream backpressure and Hard memory pressure in Enforce mode end the burst
-and pause new-fetch admission. Already-admitted work may still finish, ACK, and
+Temporary downstream queue saturation pauses new-fetch admission until the send,
+matching ACK, and durable checkpoint commit finish. If the same cycle still has
+page and elapsed-time budget, it resumes after a cooldown of `min(interval, 1s)`,
+not the full polling interval. The cooldown retains the original cycle budgets;
+elapsed time is checked again before fetching. Repeated stalls each incur this
+cooldown, and a sustained send or ACK wait that exhausts the cycle instead starts
+the full interval. Snapshots and single-page cycles always use the full interval.
+This recovery delay reuses the initial database recovery delay, with no new knob.
+
+Hard memory pressure in Enforce mode ends the burst and pauses new-fetch admission,
+even if it recovers during the send or checkpoint wait. Already-admitted work may still finish, ACK, and
 commit; pressure is not a request to discard acknowledged progress. Observe-only
 memory pressure does not block admission. Control messages remain handled
 during fetch, encoding, send, feedback, and checkpoint phases.
