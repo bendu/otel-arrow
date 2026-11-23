@@ -133,18 +133,35 @@ impl Fixture {
     fn prepare(&self) -> Result<Input> {
         match self.stage {
             Stage::Encode => Ok(Input::Rows(self.page())),
-            Stage::Rebatch => {
-                let encoded = self.encode(self.page(), PAGE_LIMIT)?;
-                let bytes = encoded
-                    .pdata
-                    .payload_ref()
-                    .encoded_bytes()
-                    .ok_or("expected encoded OTLP")?;
-                Ok(Input::Bytes(vec![OtlpProtoBytes::ExportLogsRequest(
-                    bytes.clone(),
-                )]))
-            }
+            Stage::Rebatch => Ok(self.rebatch_input(self.encode(self.page(), PAGE_LIMIT)?)),
         }
+    }
+
+    fn verify_encoded_metadata(&self, encoded: &EncodedPage) {
+        assert_eq!(encoded.row_count, self.rows);
+        assert_eq!(encoded.deferred_rows, 0);
+        assert_eq!(encoded.event_time_fallbacks, 0);
+        assert_eq!(
+            encoded.candidate,
+            Cursor::from(ScalarValue::Int64(self.rows as i64 - 1))
+        );
+        let bytes = encoded
+            .pdata
+            .payload_ref()
+            .encoded_bytes()
+            .expect("encoded OTLP");
+        assert_eq!(encoded.encoded_bytes, bytes.len());
+        assert!(bytes.len() as u64 <= PAGE_LIMIT);
+    }
+
+    fn rebatch_input(&self, encoded: EncodedPage) -> Input {
+        self.verify_encoded_metadata(&encoded);
+        let bytes = encoded
+            .pdata
+            .payload_ref()
+            .encoded_bytes()
+            .expect("encoded OTLP");
+        Input::Bytes(vec![OtlpProtoBytes::ExportLogsRequest(bytes.clone())])
     }
 
     fn execute(&self, input: Input) -> Result<Output> {
@@ -197,20 +214,12 @@ impl Output {
     fn verify(&self, fixture: &Fixture) -> (usize, usize) {
         match self {
             Self::Encoded(encoded) => {
-                assert_eq!(encoded.row_count, fixture.rows);
-                assert_eq!(encoded.deferred_rows, 0);
-                assert_eq!(encoded.event_time_fallbacks, 0);
-                assert_eq!(
-                    encoded.candidate,
-                    Cursor::from(ScalarValue::Int64(fixture.rows as i64 - 1))
-                );
+                fixture.verify_encoded_metadata(encoded);
                 let bytes = encoded
                     .pdata
                     .payload_ref()
                     .encoded_bytes()
                     .expect("encoded OTLP");
-                assert_eq!(encoded.encoded_bytes, bytes.len());
-                assert!(bytes.len() as u64 <= PAGE_LIMIT);
                 verify_logs(std::iter::once(bytes.as_ref()), fixture)
             }
             Self::Rebatched(batches) => {
@@ -388,6 +397,43 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    /// Scenario: Rebatch preparation receives valid payload bytes but corrupted encoder metadata.
+    /// Guarantees: Row count, deferred rows, cursor, reported size and fallback errors fail before metadata is discarded.
+    #[test]
+    fn rebatch_preparation_checks_encoder_metadata() {
+        let fixture = fixture(Stage::Rebatch, false, 32, 8);
+        let valid = fixture.rebatch_input(
+            fixture
+                .encode(fixture.page(), PAGE_LIMIT)
+                .expect("encoded input"),
+        );
+        _ = fixture
+            .execute(valid)
+            .expect("valid rebatching")
+            .verify(&fixture);
+        let corruptions: [fn(&mut EncodedPage); 5] = [
+            |encoded| encoded.row_count -= 1,
+            |encoded| encoded.deferred_rows = 1,
+            |encoded| encoded.candidate = ScalarValue::Int64(-1).into(),
+            |encoded| encoded.encoded_bytes += 1,
+            |encoded| encoded.event_time_fallbacks = 1,
+        ];
+        for corrupt in corruptions {
+            let mut encoded = fixture
+                .encode(fixture.page(), PAGE_LIMIT)
+                .expect("encoded input");
+            corrupt(&mut encoded);
+            // Each attempt owns its payload and changes no state shared with the next attempt.
+            let rejected = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                _ = fixture.rebatch_input(encoded);
+            }));
+            assert!(
+                rejected.is_err(),
+                "rebatch preparation accepted corrupt metadata"
+            );
         }
     }
 
