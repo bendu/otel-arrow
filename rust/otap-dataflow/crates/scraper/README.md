@@ -655,6 +655,91 @@ memory was much larger. The measured peak includes the test process and
 encoding allocations, not native database or downstream buffers. It is a
 workload-specific sizing example, not a portable peak-memory bound.
 
+### SQL page timing and heap harness
+
+The standalone `sql_page_profile` and `sql_page_heap` examples provide a
+deterministic, bounded matrix for the batching investigation in
+[the SQL receiver review][batching-review]. They reuse the existing standalone
+allocation-profile pattern and workspace `dhat` dependency. They do not require
+a database, network service, random seed, or new runtime instrumentation.
+
+Run from `rust/otap-dataflow`:
+
+```powershell
+cargo test -p otel-arrow-dfe-scraper --example sql_page_profile
+cargo build --release -p otel-arrow-dfe-scraper --examples -j 1
+.\target\release\examples\sql_page_profile.exe encode wide 1024 256 5
+.\target\release\examples\sql_page_heap.exe encode wide 1024 256 1
+.\target\release\examples\sql_page_profile.exe rebatch wide 1024 256 5
+.\target\release\examples\sql_page_heap.exe rebatch wide 1024 256 1
+```
+
+On Unix, use the corresponding extensionless binaries. If `CARGO_TARGET_DIR`
+is set, use that target directory instead. Build before timing, not concurrently
+with measurement. Run one process at a time, repeat heap runs in fresh processes,
+and record the commit, toolchain, profile, allocator, hardware and host load.
+For a bounded smoke baseline, omit `--release` and use `target/debug`; those
+results are debug-build diagnostics, not production throughput.
+
+Arguments are `encode|rebatch narrow|wide rows source_id_bytes repetitions`.
+The suggested matrix crosses both stages with both shapes, 32/1024 rows, and
+8/256-byte ASCII source IDs. Narrow rows have four columns: signed integer,
+32-byte text, 16-byte binary, and null. Wide rows repeat those types across
+32 columns with 1024-byte text and 512-byte binary. Row-dependent values expose
+loss, duplication and reordering. Limits are 4096 rows/page, 1024-byte IDs,
+20 repetitions and 32768 timed rows/process. Heap mode requires one repetition.
+
+Boundaries are deliberately separate:
+
+- `one_shot_encode`: already-owned `QueryPage` through the public `encode_page`
+  API, including per-page mapping/envelope construction, encoding and consumed
+  input destruction. This is the **cold-per-page API path**, not the receiver's
+  reused `OtlpPageEncoder`. A preflight warms only process initialization.
+- `otlp_byte_rebatch`: one already-encoded OTLP page through
+  `make_bytes_batches_owned`, with a 64 KiB target, 4096-fragment budgets and
+  64 MiB duplicate-wrapper budget. This is an existing downstream batching
+  helper, **not an exporter or a streaming implementation**. It exercises
+  pass-through for fitting pages and splitting for larger pages.
+
+The examples emit one JSON object. Timing uses the platform default allocator,
+not the heap executable's `dhat::Alloc`. Input preparation, correctness checks,
+output destruction and JSON reporting are outside timing. `elapsed_ns` contains
+each operation's duration; `rows_per_second` divides total input rows by the sum
+of those durations. Do not add these stage throughputs or call either one
+whole-pipeline throughput.
+
+Heap mode first prepares an untracked input, then copies it under a fresh
+profiler and drops the original **before** the operation. Fixture copying is
+setup, not an encoder/rebatch allocation or copy count. No duplicate fixture is
+retained across the measured operation. The profiler covers only this
+single-threaded process's tracked fixture and operation; verification and
+reporting run after it stops:
+
+- `operation_allocation_events` and `operation_allocated_bytes` are `dhat`
+  cumulative-counter deltas around the operation, excluding input setup.
+- `input_live_bytes` and `output_live_bytes` are allocator-requested live heap
+  bytes before/after the operation, including the tracked input/output and
+  helper containers, not just serialized payload.
+- `setup_peak_bytes` and `lifetime_peak_bytes` are high-water marks from profiler
+  start through input setup and through operation completion, respectively.
+  The latter includes setup; it is not an independently reset stage peak.
+- `normalized_row_bytes` sums `Row::normalized_size()`: it excludes page
+  metadata, cursor/vector overhead outside `Row`, and native driver storage.
+  `encoded_bytes_per_page` sums serialized output lengths, including repeated
+  headers after splitting. Neither is RSS. `rss_bytes` and `copy_count` are
+  explicitly null: neither is instrumented; allocation events are not copies.
+
+Every invocation checks decoded values, row order/count, resource identity,
+timestamps, the last encoded cursor, exact serialized length and byte limits.
+The example tests also check exact-fit prefix/deferred-cursor behavior and a
+first-row byte-budget failure. There are no speed or allocation-count assertions.
+These fixtures exclude driver decoding/native buffers, receiver scheduling and
+cache reuse, ACK retention/replay, OTAP conversion, exporter queues, compression,
+TLS and transport. No live database/exporter or streaming comparison is claimed.
+Extend qualification with those stages before making a batching design decision.
+
+[batching-review]: https://github.com/open-telemetry/otel-arrow/pull/4093#discussion_r4051887995
+
 `CellValue`, `ScalarValue`, and `CompositeCursor` debug output redact their values; nested
 cursor rows/pages therefore do not reveal the cursor through their debug
 representation. `CompiledQuery` also redacts SQL and its initial cursor.

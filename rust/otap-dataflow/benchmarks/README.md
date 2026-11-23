@@ -78,4 +78,11 @@ From the workspace root:
 cargo bench -p benchmarks
 ```
 
+For isolated SQL normalized-row encoding and OTLP byte-rebatch timing/heap
+measurements, see the [scraper profiling examples][sql-page-profile]. These
+standalone examples use separate timing and allocation-profile executables,
+not Criterion or a live database/exporter throughput benchmark.
+
+[sql-page-profile]: ../crates/scraper/README.md#sql-page-timing-and-heap-harness
+
 ---

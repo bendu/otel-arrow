@@ -8324,6 +8324,7 @@ dependencies = [
  "async-trait",
  "blake3",
  "chrono",
+ "dhat",
  "humantime-serde",
  "libc",
  "otel-arrow-dfe-channel",
