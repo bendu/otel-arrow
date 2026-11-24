@@ -365,6 +365,14 @@ The OTLP mapper uses a structured key-value body for selected columns.
 It does not automatically promote every column to a LogRecord attribute, or
 infer OTLP fields from matching column names. Richer mapping is future work.
 
+The configured `source_id` is emitted only as the OTLP resource attribute
+`receiver.database.source_id`, alongside `db.system.name`. For filters,
+queries, or exporter mappings that used either `receiver.database.source_id`
+or `receiver.database.query.name` as a log record attribute, read
+`resource.attributes["receiver.database.source_id"]` instead. There is no
+resource-level query-name attribute. Preserve resource metadata when exporting
+so the source ID remains available; it is not added to the body.
+
 ### SQL Validation
 
 Oracle, PostgreSQL, and SQL Server use one `SourceQuery` contract. There is no

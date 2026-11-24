@@ -23,7 +23,6 @@ use std::mem::size_of;
 
 const DATABASE_SCOPE: &str = "otel-arrow.database_receiver";
 const SOURCE_ID_ATTRIBUTE: &str = "receiver.database.source_id";
-const QUERY_NAME_ATTRIBUTE: &str = "receiver.database.query.name";
 const MAX_RETAINED_RECORD_BYTES: usize = 4 * 1024 * 1024;
 
 /// Validates configured columns against live result metadata.
@@ -117,7 +116,6 @@ impl MappingPlan {
 pub(crate) struct OtlpPageEncoder {
     mapping: MappingPlan,
     output: OutputConfig,
-    source_id: String,
     logs: LogsData,
     resource_static_bytes: usize,
     scope_static_bytes: usize,
@@ -165,7 +163,7 @@ impl OtlpPageEncoder {
                     },
                     KeyValue {
                         key: SOURCE_ID_ATTRIBUTE.to_owned(),
-                        value: Some(string_value(source_id.clone())),
+                        value: Some(string_value(source_id)),
                     },
                 ],
                 ..Default::default()
@@ -177,7 +175,6 @@ impl OtlpPageEncoder {
         Ok(Self {
             mapping,
             output,
-            source_id,
             logs: LogsData {
                 resource_logs: vec![resource],
             },
@@ -248,12 +245,8 @@ impl OtlpPageEncoder {
         }
 
         for cursor_row in rows {
-            let (record, used_event_time_fallback) = row_to_record(
-                cursor_row.row,
-                &self.mapping,
-                &self.source_id,
-                observed_time_unix_nano,
-            )?;
+            let (record, used_event_time_fallback) =
+                row_to_record(cursor_row.row, &self.mapping, observed_time_unix_nano)?;
             let record_bytes = record.encoded_len();
             let next_records_wire_bytes = records_wire_bytes
                 .saturating_add(1)
@@ -375,7 +368,6 @@ pub fn encode_page(
 fn row_to_record(
     row: Row,
     mapping: &MappingPlan,
-    source_id: &str,
     observed_time_unix_nano: u64,
 ) -> Result<(LogRecord, bool), OtlpMappingError> {
     let columns = &mapping.columns;
@@ -383,18 +375,6 @@ fn row_to_record(
         return Err(OtlpMappingError::ColumnCount);
     }
     let mut body = Vec::with_capacity(columns.len());
-    let attributes = vec![
-        KeyValue {
-            key: SOURCE_ID_ATTRIBUTE.to_owned(),
-            value: Some(string_value(source_id)),
-        },
-        KeyValue {
-            key: QUERY_NAME_ATTRIBUTE.to_owned(),
-            // The Oracle receiver has one query per source, so its stable
-            // source_id is also the unambiguous query identity.
-            value: Some(string_value(source_id)),
-        },
-    ];
     let mut event_time = None;
     let mut used_event_time_fallback = false;
     if let Some(index) = mapping.timestamp_index {
@@ -419,7 +399,6 @@ fn row_to_record(
             body: Some(AnyValue {
                 value: Some(any_value::Value::KvlistValue(KeyValueList { values: body })),
             }),
-            attributes,
             event_name: "database.query.row".to_owned(),
             ..Default::default()
         },
@@ -706,7 +685,6 @@ mod cache_tests {
                 values: vec![CellValue::String(text), CellValue::Bytes(bytes)],
             },
             &mapping,
-            "source",
             1,
         )
         .expect("mapped row");

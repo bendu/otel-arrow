@@ -159,6 +159,74 @@ fn field_value<'a>(record: &'a LogRecord, key: &str) -> &'a any_value::Value {
         .expect("body field should have a value")
 }
 
+/// Scenario: Two configured sources return identical rows with columns named like receiver metadata.
+/// Guarantees: Both encoding paths keep each source ID and database system on the resource only,
+/// omit query-name metadata, and keep both same-named columns intact in each record body.
+#[test]
+fn source_identity_is_resource_only() {
+    let source_key = "receiver.database.source_id";
+    let query_key = "receiver.database.query.name";
+    let input = page(
+        vec![
+            column(source_key, "VARCHAR2"),
+            column(query_key, "VARCHAR2"),
+        ],
+        vec![Row {
+            values: vec![
+                CellValue::String("body-source".to_owned()),
+                CellValue::String("body-query".to_owned()),
+            ],
+        }],
+    );
+    let output = OutputConfig::default();
+    for source_id in ["oracle-first", "oracle-second"] {
+        let one_shot = encode_page(
+            input.clone(),
+            DatabaseSystem::Oracle,
+            source_id,
+            &output,
+            123,
+            UNLIMITED_BYTES,
+        )
+        .expect("valid page")
+        .expect("nonempty page");
+        let mut encoder = OtlpPageEncoder::new(
+            DatabaseSystem::Oracle,
+            source_id.to_owned(),
+            output.clone(),
+            input.columns.clone(),
+        )
+        .expect("valid mapping");
+        let reused = encoder
+            .encode_page(input.clone(), 123, UNLIMITED_BYTES)
+            .expect("valid page")
+            .expect("nonempty page");
+
+        let logs = decode(one_shot);
+        assert_eq!(decode(reused), logs);
+        let resource_logs = &logs.resource_logs[0];
+        let resource = resource_logs.resource.as_ref().expect("resource");
+        assert_eq!(resource.attributes.len(), 2);
+        for (key, value) in [("db.system.name", "oracle.db"), (source_key, source_id)] {
+            assert!(resource.attributes.iter().any(|attribute| {
+                attribute.key == key
+                    && matches!(
+                        attribute.value.as_ref().and_then(|value| value.value.as_ref()),
+                        Some(any_value::Value::StringValue(actual)) if actual == value
+                    )
+            }));
+        }
+        let record = &resource_logs.scope_logs[0].log_records[0];
+        assert!(record.attributes.is_empty());
+        for (key, value) in [(source_key, "body-source"), (query_key, "body-query")] {
+            assert_eq!(
+                field_value(record, key),
+                &any_value::Value::StringValue(value.to_owned())
+            );
+        }
+    }
+}
+
 /// Scenario: One row contains every value in the closed CellValue model.
 /// Guarantees: OTLP preserves the exact scalar mapping, structured JSON body, resource and scope
 /// identity, one-row-per-record cardinality, and configured event and observation timestamps.

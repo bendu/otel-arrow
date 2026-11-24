@@ -42,6 +42,10 @@ INFO database.query.row: {event_ts=2026-10-05T00:00:01.000000Z, event_id=2, acto
 INFO database.query.row: {event_ts=2026-10-05T00:00:02.123456Z, event_id=3, actor=carol}
 ```
 
+The receiver does not generate log record attributes. For source identity
+filters and exporter mappings, see the
+[shared SQL output contract](../../../../scraper/README.md#output-configuration).
+
 Console output is not durable downstream storage. In another terminal, verify
 the live connection is encrypted:
 
