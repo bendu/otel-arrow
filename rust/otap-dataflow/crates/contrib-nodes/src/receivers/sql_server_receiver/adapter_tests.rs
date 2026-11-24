@@ -2209,7 +2209,7 @@ fn run_safe_recovery(case: SafeRecovery) {
         testing::{receiver::TestRuntime, test_node},
     };
     use otel_arrow_dfe_otap::testing::next_ack;
-    use otel_arrow_dfe_scraper::database::{CursorRow, Row};
+    use otel_arrow_dfe_scraper::database::{CursorRow, QueryPage, Row, encode_page};
     use otel_arrow_dfe_scraper::{CheckpointStore, DatabaseReceiver, SourceBinding};
 
     let prefix = matches!(case, SafeRecovery::AcknowledgedPrefix);
@@ -2218,6 +2218,9 @@ fn run_safe_recovery(case: SafeRecovery) {
     raw["query"]["catch_up"] = json!({"max_pages":if prefix { 3 } else { 1 }});
     if prefix {
         raw["query"]["max_rows_per_poll"] = json!(5);
+        // Make the OTLP envelope large enough to hit the wire limit separately
+        // from the normalized-row limit. The source ID does not affect row storage.
+        raw["source_id"] = json!("prefix-recovery-".repeat(14));
         raw["query"]["max_batch_bytes"] = json!(
             4 * (Row {
                 values: vec![CellValue::Int64(8)]
@@ -2228,6 +2231,41 @@ fn run_safe_recovery(case: SafeRecovery) {
     }
     let config: SqlServerReceiverConfig = serde_json::from_value(raw).unwrap();
     let query = config.query().clone();
+    if prefix {
+        let encoded_size = |ids: &[i64]| {
+            let page = QueryPage {
+                columns: vec![column(NativeType::BigInt, 0, false).metadata],
+                rows: ids
+                    .iter()
+                    .map(|&id| CursorRow {
+                        row: Row {
+                            values: vec![CellValue::Int64(id)],
+                        },
+                        cursor: Cursor::Scalar(ScalarValue::Int64(id)),
+                    })
+                    .collect(),
+            };
+            // Both timestamps use a nonzero fixed-width observation time.
+            encode_page(
+                page,
+                DatabaseSystem::SqlServer,
+                config.source_id(),
+                query.output(),
+                1,
+                u64::MAX,
+            )
+            .unwrap()
+            .unwrap()
+            .encoded_bytes as u64
+        };
+        let budget = query.max_batch_bytes();
+        let two_rows = encoded_size(&[8, 9]);
+        let three_rows = encoded_size(&[8, 9, 10]);
+        assert!(
+            two_rows <= budget && budget < three_rows,
+            "expected the wire budget ({budget}) to fit two rows ({two_rows}) but not three ({three_rows})"
+        );
+    }
     let recovered = vec![
         metadata_response(),
         metadata_response(),
@@ -2303,7 +2341,7 @@ fn run_safe_recovery(case: SafeRecovery) {
         "group",
         "pipeline",
         "recovery",
-        "events",
+        config.source_id(),
         config.config_fingerprint().to_owned(),
     );
     let source = SourceBinding::acquire(store.clone()).unwrap();
